@@ -76,6 +76,9 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
+// copy-transcript: text for the next request of this sequence (call before common_speculative_begin)
+void common_speculative_set_copy_text(common_speculative * spec, llama_seq_id seq_id, const std::string & text);
+
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const common_batch & batch);
 

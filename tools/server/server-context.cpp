@@ -1238,6 +1238,11 @@ private:
 
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+            if (params_base.speculative.draft.ctx_tgt == nullptr &&
+                    std::count(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                               COMMON_SPECULATIVE_TYPE_COPY_TRANSCRIPT) > 0) {
+                params_base.speculative.draft.ctx_tgt = ctx_tgt;
+            }
             try {
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
             } catch (const std::exception & e) {
@@ -3818,6 +3823,7 @@ private:
                 slot.state = SLOT_STATE_GENERATING;
 
                 if (slot.can_speculate()) {
+                    common_speculative_set_copy_text(spec.get(), slot.id, slot.task->params.speculative.copy.text);
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {

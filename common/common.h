@@ -182,6 +182,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_COPY_TRANSCRIPT, // copies the request's "transcript"
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -369,6 +370,15 @@ struct common_params_speculative_ngram_cache {
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
 };
 
+struct common_params_speculative_copy {
+    int32_t n_max     = 16; // maximum draft length (tokens)
+    int32_t min_words = 1;  // answer words that must match the transcript before drafting
+    int32_t lookahead = 4;  // transcript words searched for each answer word (deleted words)
+    int32_t whole_words = 0; // transcripts of at most this many words are drafted whole, with the final "." (0: off)
+    std::string text;        // per request (field "copy_text"): text whose words replace the matching transcript words
+    int32_t text_after_miss = 64; // after a rejected copy_text draft, later ones are at most this long (0: dropped)
+};
+
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
 
@@ -384,6 +394,8 @@ struct common_params_speculative {
     common_params_speculative_ngram_map ngram_map_k4v;
 
     common_params_speculative_ngram_cache ngram_cache;
+
+    common_params_speculative_copy copy;
 
     bool has_dft() const {
         return !draft.mparams.empty();

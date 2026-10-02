@@ -41,7 +41,8 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"copy-transcript", COMMON_SPECULATIVE_TYPE_COPY_TRANSCRIPT}
 };
 
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
@@ -1746,6 +1747,473 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 };
 
+// copy-transcript: drafts the next words of the request's transcript.
+//
+// The cleanup prompt carries the ASR transcript as a JSON string ("transcript": "...") and the answer is
+// mostly that transcript with punctuation and a few fixed words. This drafter keeps the answer aligned
+// with the transcript word by word, ignoring case and punctuation. While the last answer word matches,
+// it proposes the following transcript words (including the rest of a word the model has started).
+// After an edit (an answer word that is not the next transcript word) it proposes nothing until the
+// answer is back in step, and the next drafter in priority (MTP) or the model itself covers that spot.
+// It never drafts the first answer word, so a one-token "=" answer costs nothing extra. With
+// --spec-copy-whole-words N, a transcript of at most N words is drafted whole from the model's first word on,
+// ending with "." in final mode: a short utterance that needs no edits is then accepted in one check.
+// A request may also send "copy_text": an expected beginning of the answer (for example the last cleaned interim
+// plus the punctuation model's text of the remaining words). It is tried first, from the answer's first word and
+// to its own end; where it has nothing to propose, the transcript is used. A copy_text word followed by the stop
+// mark U+2016 ("world‖") ends a draft there: the caller is unsure what follows it (a punctuation mark the
+// punctuation model scored low), so the model decides that itself and the next draft continues after it. After a
+// rejected copy_text draft, later ones are at most --spec-copy-text-after-miss tokens (0: copy_text is dropped).
+// Added to common/speculative.cpp at upstream b11243.
+
+namespace copy_transcript {
+
+static bool utf8_next(const std::string & s, size_t & i, uint32_t & cp) {
+    if (i >= s.size()) {
+        return false;
+    }
+    const unsigned char c = (unsigned char) s[i];
+    int len = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 1;
+    if (i + len > s.size()) {
+        len = 1;
+    }
+    cp = len == 1 ? c : len == 2 ? (c & 0x1F) : len == 3 ? (c & 0x0F) : (c & 0x07);
+    for (int k = 1; k < len; ++k) {
+        cp = (cp << 6) | ((unsigned char) s[i + k] & 0x3F);
+    }
+    i += len;
+    return true;
+}
+
+static void utf8_append(std::string & out, uint32_t cp) {
+    if (cp < 0x80) {
+        out += (char) cp;
+    } else if (cp < 0x800) {
+        out += (char) (0xC0 | (cp >> 6));
+        out += (char) (0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        out += (char) (0xE0 | (cp >> 12));
+        out += (char) (0x80 | ((cp >> 6) & 0x3F));
+        out += (char) (0x80 | (cp & 0x3F));
+    } else {
+        out += (char) (0xF0 | (cp >> 18));
+        out += (char) (0x80 | ((cp >> 12) & 0x3F));
+        out += (char) (0x80 | ((cp >> 6) & 0x3F));
+        out += (char) (0x80 | (cp & 0x3F));
+    }
+}
+
+// lower case for the scripts the cleanup serves (Latin incl. Latin-1/Extended-A, Greek, Cyrillic)
+static uint32_t lower(uint32_t c) {
+    if (c >= 'A' && c <= 'Z') return c + 32;
+    if (c >= 0xC0 && c <= 0xDE && c != 0xD7) return c + 32;
+    if ((c >= 0x100 && c <= 0x137) || (c >= 0x14A && c <= 0x177)) return c | 1;
+    if (c >= 0x139 && c <= 0x148 && (c & 1)) return c + 1;
+    if (c >= 0x391 && c <= 0x3A9 && c != 0x3A2) return c + 32;
+    if (c >= 0x410 && c <= 0x42F) return c + 32;
+    if (c >= 0x400 && c <= 0x40F) return c + 80;
+    return c;
+}
+
+static uint32_t upper(uint32_t c) {
+    if (c >= 'a' && c <= 'z') return c - 32;
+    if (c >= 0xE0 && c <= 0xFE && c != 0xF7) return c - 32;
+    if (((c >= 0x100 && c <= 0x137) || (c >= 0x14A && c <= 0x177)) && (c & 1)) return c - 1;
+    if (c >= 0x13A && c <= 0x148 && !(c & 1)) return c - 1;
+    if (c >= 0x3B1 && c <= 0x3C9 && c != 0x3C2) return c - 32;
+    if (c >= 0x430 && c <= 0x44F) return c - 32;
+    if (c >= 0x450 && c <= 0x45F) return c - 80;
+    return c;
+}
+
+// the word with its first letter capitalized
+static std::string capitalize(const std::string & w) {
+    size_t i = 0;
+    uint32_t cp;
+    if (!utf8_next(w, i, cp)) {
+        return w;
+    }
+    std::string out;
+    utf8_append(out, upper(cp));
+    return out + w.substr(i);
+}
+
+static bool is_space(uint32_t c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 0xA0 || c == 0x202F || c == 0x3000;
+}
+
+// letters and digits; apostrophes, hyphens and all punctuation are ignored when comparing words
+static bool is_word(uint32_t c) {
+    if (c < 0x80) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+    }
+    if (c == 0xA1 || c == 0xAB || c == 0xB7 || c == 0xBB || c == 0xBF || c == 0xD7 || c == 0xF7) return false;
+    if (c >= 0x2000 && c <= 0x206F) return false; // general punctuation: dashes, quotes, ellipsis
+    if (c >= 0x3000 && c <= 0x303F) return false;
+    return !is_space(c);
+}
+
+static std::string norm(const std::string & w) {
+    std::string out;
+    size_t i = 0;
+    uint32_t cp;
+    while (utf8_next(w, i, cp)) {
+        if (is_word(cp)) {
+            utf8_append(out, lower(cp));
+        }
+    }
+    return out;
+}
+
+static std::vector<std::string> split(const std::string & s) {
+    std::vector<std::string> words;
+    std::string cur;
+    size_t i = 0, start = 0;
+    uint32_t cp;
+    while (start = i, utf8_next(s, i, cp)) {
+        if (is_space(cp)) {
+            if (!cur.empty()) {
+                words.push_back(cur);
+                cur.clear();
+            }
+        } else {
+            cur.append(s, start, i - start);
+        }
+    }
+    if (!cur.empty()) {
+        words.push_back(cur);
+    }
+    return words;
+}
+
+// the JSON string value of the last "transcript" key in the prompt text, or "" if there is none
+static std::string transcript_from_prompt_unsafe(const std::string & text);
+
+static std::string transcript_from_prompt(const std::string & text) {
+    try {
+        return transcript_from_prompt_unsafe(text);
+    } catch (const std::exception &) { // malformed \u escape
+        return "";
+    }
+}
+
+static std::string transcript_from_prompt_unsafe(const std::string & text) {
+    static const std::string key = "\"transcript\": \"";
+    const size_t at = text.rfind(key);
+    if (at == std::string::npos) {
+        return "";
+    }
+    std::string out;
+    for (size_t i = at + key.size(); i < text.size(); ++i) {
+        const char c = text[i];
+        if (c == '"') {
+            return out;
+        }
+        if (c != '\\' || i + 1 >= text.size()) {
+            out += c;
+            continue;
+        }
+        const char e = text[++i];
+        switch (e) {
+            case 'n': out += ' '; break;
+            case 't': out += ' '; break;
+            case 'r': out += ' '; break;
+            case 'b': case 'f': break;
+            case 'u': {
+                if (i + 4 >= text.size()) {
+                    return out;
+                }
+                uint32_t cp = (uint32_t) std::stoul(text.substr(i + 1, 4), nullptr, 16);
+                i += 4;
+                if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 < text.size() && text[i + 1] == '\\' && text[i + 2] == 'u') {
+                    const uint32_t lo = (uint32_t) std::stoul(text.substr(i + 3, 4), nullptr, 16);
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                    i += 6;
+                }
+                utf8_append(out, cp);
+                break;
+            }
+            default: out += e; break; // \" \\ \/
+        }
+    }
+    return ""; // unterminated: not the request's transcript
+}
+
+struct seq_state {
+    bool ok = false;
+    size_t n_prompt = 0;
+    std::vector<std::string> raw;       // transcript words as written
+    std::vector<std::string> norm;      // the same words lower-cased without punctuation
+    bool final_mode = true;             // "mode": "final" (the answer ends with punctuation) or "partial"
+    std::vector<std::string> copy_raw;  // the request's copy_text words (an expected beginning of the answer)
+    std::vector<std::string> copy_norm;
+    std::vector<bool> copy_stop;        // a draft ends after this copy_text word (it carried the stop mark)
+    int copy_misses = 0;                // copy_text drafts the model rejected (not accepted to their end)
+    int last_copy_len = 0;              // length of the last draft if it came from copy_text, else 0
+};
+
+struct alignment {
+    bool ok = false;   // the answer's last word matched the source
+    size_t p = 0;      // next source word
+    int n_matched = 0; // answer words found in the source
+    std::string head;  // the rest of a source word the answer has started
+};
+
+// Align the answer (its complete words and its unfinished last word) with a source word list, ignoring case
+// and punctuation. A word not found among the next `lookahead` source words is an edit; the answer is back in
+// step at the next word that is found. `from_start` allows drafting before any complete word matched.
+static alignment align(const std::vector<std::string> & words, const std::string & partial,
+                       const std::vector<std::string> & raw, const std::vector<std::string> & nrm,
+                       int lookahead, bool from_start) {
+    alignment a;
+    const size_t T = nrm.size();
+    bool last_matched = false;
+    for (const auto & w : words) {
+        const std::string n = norm(w);
+        if (n.empty()) {
+            continue;
+        }
+        size_t found = T;
+        for (size_t j = a.p; j < std::min(T, a.p + (size_t) lookahead); ++j) {
+            if (nrm[j] == n) {
+                found = j;
+                break;
+            }
+        }
+        last_matched = found < T;
+        if (last_matched) {
+            a.p = found + 1;
+            a.n_matched++;
+        }
+    }
+    if (!partial.empty()) {
+        const std::string pn = norm(partial);
+        if (a.p < T && nrm[a.p] == pn) {
+            // a complete word without its trailing space yet
+            a.p++;
+            a.n_matched++;
+            last_matched = true;
+        } else if (a.p < T && nrm[a.p].size() > pn.size() && nrm[a.p].compare(0, pn.size(), pn) == 0 &&
+                   (last_matched || (from_start && a.n_matched == 0 && a.p == 0))) {
+            // the rest of the source word the model has started: skip as many letters as it wrote
+            const std::string & w = raw[a.p];
+            size_t i = 0, consumed = 0;
+            uint32_t cp;
+            while (consumed < pn.size() && utf8_next(w, i, cp)) {
+                if (is_word(cp)) {
+                    std::string tmp;
+                    utf8_append(tmp, lower(cp));
+                    consumed += tmp.size();
+                }
+            }
+            a.head = w.substr(i);
+            a.p++;
+            last_matched = true;
+        } else {
+            return a;
+        }
+    }
+    a.ok = last_matched || (from_start && words.empty() && partial.empty());
+    return a;
+}
+
+static void split_words(const std::string & text, std::vector<std::string> & raw, std::vector<std::string> & nrm,
+                        std::vector<bool> * stop = nullptr) {
+    static const std::string mark = "\xE2\x80\x96"; // U+2016, the copy_text stop mark
+    for (auto w : split(text)) {
+        bool stop_here = false;
+        for (size_t at; (at = w.find(mark)) != std::string::npos; stop_here = true) {
+            w.erase(at, mark.size());
+        }
+        std::string n = norm(w);
+        if (!n.empty()) {
+            raw.push_back(w);
+            nrm.push_back(std::move(n));
+            if (stop) {
+                stop->push_back(stop_here);
+            }
+        } else if (stop_here && stop && !stop->empty()) {
+            stop->back() = true; // a mark standing alone stops after the previous word
+        }
+    }
+}
+
+} // namespace copy_transcript
+
+struct common_speculative_impl_copy_transcript : public common_speculative_impl {
+    common_params_speculative_copy params;
+    const llama_vocab * vocab = nullptr;
+    std::vector<copy_transcript::seq_state> state;
+    std::vector<std::string> pending_text; // copy_text of the request about to begin, per sequence
+
+    common_speculative_impl_copy_transcript(const common_params_speculative & params, uint32_t n_seq)
+        // reserves room for long drafts (copy_text and whole short transcripts can come with any request);
+        // the server sizes its output buffers from this, and a longer draft would overflow them
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_COPY_TRANSCRIPT, n_seq, std::max(params.copy.n_max, (int32_t) 64))
+        , params(params.copy)
+        , state(n_seq)
+        , pending_text(n_seq)
+    {
+        if (params.draft.ctx_tgt == nullptr) {
+            throw std::runtime_error("copy-transcript needs the target context");
+        }
+        vocab = llama_model_get_vocab(llama_get_model(params.draft.ctx_tgt));
+        SPC_TRC("adding speculative implementation 'copy-transcript' (n_max=%d, min_words=%d, lookahead=%d, whole_words=%d)\n",
+                this->params.n_max, this->params.min_words, this->params.lookahead, this->params.whole_words);
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        GGML_ASSERT(seq_id < (llama_seq_id) n_seq);
+        auto & st = state[seq_id];
+        st = {};
+        st.n_prompt = prompt.size();
+        const std::string text = common_detokenize(vocab, prompt, false);
+        const size_t partial_at = text.rfind("\"mode\": \"partial\"");
+        const size_t final_at = text.rfind("\"mode\": \"final\"");
+        st.final_mode = partial_at == std::string::npos || (final_at != std::string::npos && final_at > partial_at);
+        copy_transcript::split_words(copy_transcript::transcript_from_prompt(text), st.raw, st.norm);
+        copy_transcript::split_words(pending_text[seq_id], st.copy_raw, st.copy_norm, &st.copy_stop);
+        pending_text[seq_id].clear();
+        st.ok = !st.raw.empty() || !st.copy_raw.empty();
+    }
+
+    void set_copy_text(llama_seq_id seq_id, const std::string & text) {
+        if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            pending_text[seq_id] = text;
+        }
+    }
+
+    bool process(const common_batch & /*batch*/) override {
+        return true;
+    }
+
+    // `text` tokenized as the continuation of the answer's last token, at most n_max tokens
+    llama_tokens tokens_after(llama_token last, const std::string & text, int32_t n_max) const {
+        llama_tokens draft;
+        const std::string last_piece = common_token_to_piece(vocab, last, false);
+        llama_tokens joint = common_tokenize(vocab, last_piece + text, false, false);
+        llama_tokens alone = common_tokenize(vocab, last_piece, false, false);
+        if (!alone.empty() && alone.back() == last && joint.size() > alone.size() &&
+                std::equal(alone.begin(), alone.end(), joint.begin())) {
+            draft.assign(joint.begin() + alone.size(), joint.end());
+        } else {
+            draft = common_tokenize(vocab, text, false, false);
+        }
+        if ((int32_t) draft.size() > n_max) {
+            draft.resize(n_max);
+        }
+        return draft;
+    }
+
+    llama_tokens draft_one(copy_transcript::seq_state & st, const common_speculative_draft_params & dp) const {
+        st.last_copy_len = 0;
+        const llama_tokens & hist = *dp.prompt;
+        if (hist.size() < st.n_prompt) {
+            return {};
+        }
+        llama_tokens gen(hist.begin() + st.n_prompt, hist.end());
+        gen.push_back(dp.id_last);
+        const std::string out = common_detokenize(vocab, gen, false);
+
+        // the answer's last word may still be unfinished (the model continues it with the next token);
+        // after a sentence end the model capitalizes the next word, so the draft does too
+        bool ends_in_word = false;
+        bool sentence_end = false;
+        {
+            size_t i = 0;
+            uint32_t cp = 0, last = ' ', last_visible = ' ';
+            while (copy_transcript::utf8_next(out, i, cp)) {
+                last = cp;
+                if (!copy_transcript::is_space(cp)) {
+                    last_visible = cp;
+                }
+            }
+            ends_in_word = copy_transcript::is_word(last);
+            sentence_end = last_visible == '.' || last_visible == '?' || last_visible == '!' || last_visible == 0x2026;
+        }
+        std::vector<std::string> words = copy_transcript::split(out);
+        std::string partial;
+        if (ends_in_word && !words.empty()) {
+            partial = words.back();
+            words.pop_back();
+        }
+        const int32_t long_max = dp.n_max > 0 ? std::min(this->n_max, dp.n_max) : this->n_max;
+
+        // 1) the request's copy_text: an expected beginning of the answer, drafted to its end or its next stop mark
+        const int32_t copy_max = st.copy_misses > 0 ? std::min(long_max, params.text_after_miss) : long_max;
+        if (!st.copy_norm.empty() && copy_max > 0) {
+            const auto a = copy_transcript::align(words, partial, st.copy_raw, st.copy_norm, params.lookahead, true);
+            // the answer has just completed a stop word: the model's next token (a mark or a space) comes first
+            const bool stopped_here = a.p > 0 && !partial.empty() && a.head.empty() && st.copy_stop[a.p - 1];
+            if (stopped_here) {
+                return {}; // not the transcript either: it has no marks; MTP or the model writes the next token
+            }
+            if (a.ok && (a.p < st.copy_norm.size() || !a.head.empty())) {
+                std::string text = a.head;
+                const bool head_stops = !a.head.empty() && st.copy_stop[a.p - 1];
+                for (size_t j = a.p; j < st.copy_raw.size() && !head_stops; ++j) {
+                    text += " " + st.copy_raw[j];
+                    if (st.copy_stop[j]) {
+                        break;
+                    }
+                }
+                llama_tokens draft = tokens_after(gen.back(), text, copy_max);
+                st.last_copy_len = (int) draft.size();
+                return draft;
+            }
+        }
+
+        // 2) the transcript: n_max words at a time, or a short transcript whole with the final full stop
+        const size_t T = st.norm.size();
+        const bool whole = params.whole_words > 0 && T <= (size_t) params.whole_words;
+        const auto a = copy_transcript::align(words, partial, st.raw, st.norm, params.lookahead, whole);
+        if (!a.ok || (!whole && a.n_matched < params.min_words) || (a.head.empty() && a.p >= T)) {
+            return {};
+        }
+        std::string text = a.head;
+        const size_t n_words = whole ? T - std::min(a.p, T) : (size_t) params.n_max;
+        for (size_t j = a.p; j < T && j < a.p + n_words; ++j) {
+            text += " ";
+            text += (j == a.p && a.head.empty() && sentence_end) ? copy_transcript::capitalize(st.raw[j]) : st.raw[j];
+        }
+        if (whole && st.final_mode) {
+            const std::string & last = st.raw.back();
+            const char end = last.empty() ? ' ' : last.back();
+            if (end != '.' && end != '?' && end != '!') {
+                text += ".";
+            }
+        }
+        int32_t n_max = whole ? long_max : params.n_max;
+        if (dp.n_max > 0) {
+            n_max = std::min(n_max, dp.n_max);
+        }
+        return tokens_after(gen.back(), text, n_max);
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        assert(dparams.size() == n_seq);
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting || !state[seq_id].ok) {
+                continue;
+            }
+            *dp.result = draft_one(state[seq_id], dp);
+        }
+    }
+
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        // every draft re-aligns the whole answer; only rejected copy_text drafts are counted
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        auto & st = state[seq_id];
+        if (!is_other && st.last_copy_len > 0 && n_accepted < st.last_copy_len) {
+            st.copy_misses++;
+        }
+        st.last_copy_len = 0;
+    }
+};
+
 // state of self-speculation (simple implementation, not ngram-map)
 struct common_speculative_impl_ngram_simple : public common_speculative_impl {
     common_params_speculative_ngram_map params;
@@ -2239,6 +2707,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram-mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram-cache";
+        case COMMON_SPECULATIVE_TYPE_COPY_TRANSCRIPT: return "copy-transcript";
         default:                                    return "unknown";
     }
 }
@@ -2341,6 +2810,10 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
                 n_max = std::max(n_max, (int32_t) 8);
+                break;
+            case COMMON_SPECULATIVE_TYPE_COPY_TRANSCRIPT:
+                // copy_text and whole short transcripts are drafted in one go (up to 64 tokens)
+                n_max = std::max(n_max, std::max(spec->copy.n_max, (int32_t) 64));
                 break;
             case COMMON_SPECULATIVE_TYPE_NONE:
             case COMMON_SPECULATIVE_TYPE_COUNT:
@@ -2612,10 +3085,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         };
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 11);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 12);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_COPY_TRANSCRIPT, params.draft.ctx_tgt != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
@@ -2645,6 +3119,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
                 impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_COPY_TRANSCRIPT: {
+                impls.push_back(std::make_unique<common_speculative_impl_copy_transcript>(config.params, n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {
@@ -2760,6 +3238,17 @@ common_speculative_draft_params & common_speculative_get_draft_params(
     GGML_ASSERT(seq_id < (llama_seq_id) spec->dparams.size());
 
     return spec->dparams[seq_id];
+}
+
+void common_speculative_set_copy_text(common_speculative * spec, llama_seq_id seq_id, const std::string & text) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        if (impl->type == COMMON_SPECULATIVE_TYPE_COPY_TRANSCRIPT) {
+            static_cast<common_speculative_impl_copy_transcript *>(impl.get())->set_copy_text(seq_id, text);
+        }
+    }
 }
 
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt) {
