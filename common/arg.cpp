@@ -4342,6 +4342,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--spec-copy-prompt"},
+        "copy-transcript: draft a request's copy_text in the prompt pass, checked by the prompt's last logits (default: off)",
+        [](common_params & params) {
+            params.speculative.copy.in_prompt = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--spec-ngram-simple-min-hits"}, "N",
         string_format("minimum hits for ngram-simple speculative decoding (default: %d)", params.speculative.ngram_simple.min_hits),
         [](common_params & params, int value) {

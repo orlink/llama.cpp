@@ -1764,6 +1764,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 // mark U+2016 ("world‖") ends a draft there: the caller is unsure what follows it (a punctuation mark the
 // punctuation model scored low), so the model decides that itself and the next draft continues after it. After a
 // rejected copy_text draft, later ones are at most --spec-copy-text-after-miss tokens (0: copy_text is dropped).
+// With --spec-copy-prompt, copy_text is drafted in the prompt pass as well (draft_prompt): the prompt's last logits check
+// its first token, so a short answer that matches the draft needs one model pass fewer.
 // Added to common/speculative.cpp at upstream b11243.
 
 namespace copy_transcript {
@@ -2199,6 +2201,36 @@ struct common_speculative_impl_copy_transcript : public common_speculative_impl 
             }
             *dp.result = draft_one(state[seq_id], dp);
         }
+    }
+
+    // the request's copy_text from its first word to its end or first stop mark, tokenized as the start of the
+    // answer: drafted in the prompt pass (--spec-copy-prompt), before the model has written anything
+    llama_tokens draft_prompt(llama_seq_id seq_id, int32_t n_max) {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return {};
+        }
+        auto & st = state[seq_id];
+        st.last_copy_len = 0;
+        if (!st.ok || st.copy_raw.empty() || n_max <= 0) {
+            return {};
+        }
+        std::string text;
+        for (size_t j = 0; j < st.copy_raw.size(); ++j) {
+            if (j > 0) {
+                text += " ";
+            }
+            text += st.copy_raw[j];
+            if (st.copy_stop[j]) {
+                break;
+            }
+        }
+        llama_tokens draft = common_tokenize(vocab, text, false, false);
+        const int32_t cap = std::min(n_max, this->n_max);
+        if ((int32_t) draft.size() > cap) {
+            draft.resize(cap);
+        }
+        st.last_copy_len = (int) draft.size();
+        return draft;
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
@@ -3249,6 +3281,25 @@ void common_speculative_set_copy_text(common_speculative * spec, llama_seq_id se
             static_cast<common_speculative_impl_copy_transcript *>(impl.get())->set_copy_text(seq_id, text);
         }
     }
+}
+
+llama_tokens common_speculative_draft_prompt(common_speculative * spec, llama_seq_id seq_id, int32_t n_max) {
+    if (spec == nullptr) {
+        return {};
+    }
+    for (auto & impl : spec->impls) {
+        if (impl->type != COMMON_SPECULATIVE_TYPE_COPY_TRANSCRIPT) {
+            continue;
+        }
+        llama_tokens draft = static_cast<common_speculative_impl_copy_transcript *>(impl.get())->draft_prompt(seq_id, n_max);
+        if (!draft.empty()) {
+            spec->impl_last[seq_id] = impl.get(); // common_speculative_accept() reports to this implementation
+            impl->n_gen_drafts++;
+            impl->n_gen_tokens += draft.size();
+        }
+        return draft;
+    }
+    return {};
 }
 
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt) {

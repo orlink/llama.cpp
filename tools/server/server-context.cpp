@@ -215,6 +215,7 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+    bool spec_begun = false; // the drafters were started in the prompt pass (copy_text drafted with the prompt)
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -329,6 +330,7 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        spec_begun     = false;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -3587,6 +3589,32 @@ private:
                         slot.i_batch     = batch.size() - 1;
 
                         slot.init_sampler();
+
+                        // copy-transcript (--spec-copy-prompt): draft the request's copy_text right after the prompt,
+                        // in the same batch; the last prompt token's logits check its first token, so a short answer
+                        // that matches is done in one pass. The usual verification (post_decode) accepts or rolls back.
+                        if (params_base.speculative.copy.in_prompt && slot.can_speculate() && !has_mtmd &&
+                                !slot.task->params.speculative.copy.text.empty() && !slot.task->is_parent() &&
+                                ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+                                ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+                            common_speculative_set_copy_text(spec.get(), slot.id, slot.task->params.speculative.copy.text);
+                            common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                            slot.spec_begun = true;
+
+                            const int n_max = std::min<int>(slot.get_n_draft_max(), n_batch - (int) batch.size());
+                            llama_tokens draft = n_max > 0 ? common_speculative_draft_prompt(spec.get(), slot.id, n_max) : llama_tokens();
+                            if (!draft.empty()) {
+                                slot.spec_i_batch.push_back(batch.size() - 1);
+                                auto pos0 = slot.prompt.tokens.pos_next();
+                                for (auto token : draft) {
+                                    slot.spec_i_batch.push_back(batch.size());
+                                    add_ok &= batch.add(slot.id, token, pos0++, true, false);
+                                }
+                                slot.prompt.tokens.insert(draft);
+                                slot.stats.n_draft_tokens += draft.size();
+                                slot.spec_draft = std::move(draft);
+                            }
+                        }
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
@@ -3822,9 +3850,17 @@ private:
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
 
-                if (slot.can_speculate()) {
+                if (slot.can_speculate() && !slot.spec_begun) {
                     common_speculative_set_copy_text(spec.get(), slot.id, slot.task->params.speculative.copy.text);
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                }
+
+                if (!slot.spec_draft.empty()) {
+                    // copy_text was drafted in the prompt pass: the verification below takes the first tokens
+                    slot.stats.update_prompt_last();
+                    slot.t_print_last = ggml_time_us();
+                    slot.n_gen_last = 0;
+                    slot.i_batch = -1;
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {
                 return;

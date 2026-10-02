@@ -377,6 +377,7 @@ struct common_params_speculative_copy {
     int32_t whole_words = 0; // transcripts of at most this many words are drafted whole, with the final "." (0: off)
     std::string text;        // per request (field "copy_text"): text whose words replace the matching transcript words
     int32_t text_after_miss = 64; // after a rejected copy_text draft, later ones are at most this long (0: dropped)
+    bool in_prompt = false;       // draft copy_text in the prompt pass (verified with the prompt's last logits)
 };
 
 struct common_params_speculative {
