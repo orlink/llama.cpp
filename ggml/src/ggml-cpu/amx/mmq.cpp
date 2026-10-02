@@ -1,3 +1,6 @@
+#include <atomic>
+#include <cmath>
+#include <vector>
 #if defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wpedantic"
 #pragma GCC diagnostic ignored "-Wunused-local-typedefs"
@@ -1983,6 +1986,178 @@ struct tinygemm_kernel_vnni<block_q8_K, block_iq4_xs, float, BLOCK_M, BLOCK_N, B
     }
 };
 
+// Multi-row AVX512-VNNI kernels for small batches (inserted into ggml-cpu/amx/mmq.cpp by apply_patch.py).
+//
+// Upstream sends M == 1 to a VNNI kernel and every M >= 2 to the AMX tile kernel, which costs a fixed overhead
+// (per 32-value block: tile multiply, store, rescale; Q4_0 also unpacks B per block) and is slow for 2-16 rows.
+// These kernels keep the inner loops of the M == 1 kernels above (same packed VNNI layouts) and multiply each
+// weight block read with up to 8 activation rows: 4 rows x 64 columns or 8 rows x 32 columns per call (16
+// accumulator registers).
+//
+// Probe history (2026-10-02, 4 Granite Rapids cores, ms per pass): 4 rows x 64 columns per weight read was fastest for 2-4 rows
+// and lost from 6 rows (weights re-read per 4 rows); 16 rows x 16 columns with the activation sums precomputed was
+// slower at every size; 8 rows x 32 columns was best for 5-8 rows. Above 8 rows the AMX kernel is as fast.
+
+constexpr int VNNI_ROWS_MAX = 8;
+
+// Q4_0 weights: unsigned nibbles (u8) x signed activations (s8), minus 8 * sum(a) per block (acomp, precomputed).
+template <int ROWS, int BLOCK_N>
+static void vnni_rows_q4_0(int KB, const block_q8_0 * RESTRICT A, const int32_t * RESTRICT acomp,
+                           const char * RESTRICT B, float * RESTRICT C, int ldc) {
+    constexpr int COLS = BLOCK_N / 16;
+    const int TILE_SIZE = TILE_N * sizeof(block_q4_0);
+    const __m512i lowMask = _mm512_set1_epi8(0xF);
+
+    __m512 vc[ROWS][COLS];
+#pragma GCC unroll 8
+    for (int r = 0; r < ROWS; ++r)
+#pragma GCC unroll 4
+        for (int c = 0; c < COLS; ++c) vc[r][c] = _mm512_setzero_ps();
+
+    for (int i = 0; i < KB; ++i) {
+#pragma GCC unroll 4
+        for (int c = 0; c < COLS; ++c) {
+            const char * b_ptr = B + PACKED_INDEX(c, i, KB, TILE_SIZE);
+            __m512i vb[8];
+#pragma GCC unroll 4
+            for (int k = 0; k < 8; k += 2) {
+                const __m512i bytes = _mm512_loadu_si512((const __m512i *)(b_ptr + k * 32));
+                vb[k + 0] = _mm512_and_si512(bytes, lowMask);
+                vb[k + 1] = _mm512_and_si512(_mm512_srli_epi16(bytes, 4), lowMask);
+            }
+            const __m512 vd0 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(b_ptr + TILE_N * TILE_K / 2)));
+#pragma GCC unroll 8
+            for (int r = 0; r < ROWS; ++r) {
+                const block_q8_0 & a = A[r * KB + i];
+                const int32_t * a_ptr = reinterpret_cast<const int32_t *>(a.qs);
+                __m512i vsum = _mm512_setzero_si512();
+#pragma GCC unroll 8
+                for (int k = 0; k < 8; ++k) {
+                    vsum = _mm512_dpbusd_epi32(vsum, vb[k], _mm512_set1_epi32(a_ptr[k]));
+                }
+                vsum = _mm512_sub_epi32(vsum, _mm512_set1_epi32(acomp[r * KB + i]));
+                vc[r][c] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(vsum),
+                                           _mm512_mul_ps(vd0, _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a.d))), vc[r][c]);
+            }
+        }
+    }
+#pragma GCC unroll 8
+    for (int r = 0; r < ROWS; ++r)
+#pragma GCC unroll 4
+        for (int c = 0; c < COLS; ++c) _mm512_storeu_ps(C + r * ldc + c * 16, vc[r][c]);
+}
+
+// Q8_0 weights: (a + 128) as u8 x weights s8, minus 128 * sum(b) (packed with B), as the M == 1 kernel.
+template <int ROWS, int BLOCK_N>
+static void vnni_rows_q8_0(int KB, const block_q8_0 * RESTRICT A, const int32_t * RESTRICT /*acomp*/,
+                           const char * RESTRICT B, float * RESTRICT C, int ldc) {
+    constexpr int COLS = BLOCK_N / 16;
+    const int TILE_SIZE = TILE_N * sizeof(block_q8_0) + TILE_N * sizeof(int32_t);
+    const __m512i off = _mm512_set1_epi8(static_cast<char>(0x80));
+
+    __m512 vc[ROWS][COLS];
+#pragma GCC unroll 8
+    for (int r = 0; r < ROWS; ++r)
+#pragma GCC unroll 4
+        for (int c = 0; c < COLS; ++c) vc[r][c] = _mm512_setzero_ps();
+
+    for (int i = 0; i < KB; ++i) {
+#pragma GCC unroll 8
+        for (int r = 0; r < ROWS; ++r) {
+            const block_q8_0 & a = A[r * KB + i];
+            const int32_t * a_ptr = reinterpret_cast<const int32_t *>(a.qs);
+            __m512i va[8];
+#pragma GCC unroll 8
+            for (int k = 0; k < 8; ++k) va[k] = _mm512_add_epi8(_mm512_set1_epi32(a_ptr[k]), off);
+            const __m512 vd1 = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a.d));
+#pragma GCC unroll 4
+            for (int c = 0; c < COLS; ++c) {
+                const char * b_ptr = B + PACKED_INDEX(c, i, KB, TILE_SIZE);
+                __m512i vsum = _mm512_setzero_si512();
+#pragma GCC unroll 8
+                for (int k = 0; k < 8; ++k) {
+                    vsum = _mm512_dpbusd_epi32(vsum, va[k], _mm512_loadu_si512((const __m512i *)(b_ptr + k * 64)));
+                }
+                const __m512 vd0 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(b_ptr + TILE_N * TILE_K)));
+                const __m512i vcomp = _mm512_loadu_si512((const __m512i *)(b_ptr + TILE_N * TILE_K + TILE_N * sizeof(ggml_half)));
+                vsum = _mm512_sub_epi32(vsum, vcomp);
+                vc[r][c] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(vsum), _mm512_mul_ps(vd0, vd1), vc[r][c]);
+            }
+        }
+    }
+#pragma GCC unroll 8
+    for (int r = 0; r < ROWS; ++r)
+#pragma GCC unroll 4
+        for (int c = 0; c < COLS; ++c) _mm512_storeu_ps(C + r * ldc + c * 16, vc[r][c]);
+}
+
+// 8 * sum(a) of every 32-value block of the quantized activation rows (for Q4_0)
+static void vnni_rows_prepare(const block_q8_0 * A, int n, int32_t * acomp) {
+    const __m256i flip = _mm256_set1_epi8(static_cast<char>(0x80));
+    for (int j = 0; j < n; ++j) {
+        const __m256i qu = _mm256_xor_si256(_mm256_loadu_si256((const __m256i *)A[j].qs), flip);
+        const __m256i s = _mm256_sad_epu8(qu, _mm256_setzero_si256());
+        acomp[j] = 8 * ((int32_t)(_mm256_extract_epi64(s, 0) + _mm256_extract_epi64(s, 1) +
+                                  _mm256_extract_epi64(s, 2) + _mm256_extract_epi64(s, 3)) - 32 * 128);
+    }
+}
+
+// rows (1..8) x cols (32, or 64 for up to 4 rows) per call
+template <typename TB>
+static void vnni_rows(int rows, int cols, int KB, const block_q8_0 * A, const int32_t * acomp, const char * B, float * C,
+                      int ldc) {
+#define VNNI_ROWS_CALL(R, NC) \
+        if constexpr (std::is_same<TB, block_q4_0>::value) { vnni_rows_q4_0<R, NC>(KB, A, acomp, B, C, ldc); } \
+        else { vnni_rows_q8_0<R, NC>(KB, A, acomp, B, C, ldc); }
+    switch (rows * 100 + cols) {
+        case 164: VNNI_ROWS_CALL(1, 64) break;
+        case 264: VNNI_ROWS_CALL(2, 64) break;
+        case 364: VNNI_ROWS_CALL(3, 64) break;
+        case 464: VNNI_ROWS_CALL(4, 64) break;
+        case 132: VNNI_ROWS_CALL(1, 32) break;
+        case 232: VNNI_ROWS_CALL(2, 32) break;
+        case 332: VNNI_ROWS_CALL(3, 32) break;
+        case 432: VNNI_ROWS_CALL(4, 32) break;
+        case 532: VNNI_ROWS_CALL(5, 32) break;
+        case 632: VNNI_ROWS_CALL(6, 32) break;
+        case 732: VNNI_ROWS_CALL(7, 32) break;
+        case 832: VNNI_ROWS_CALL(8, 32) break;
+        default: fprintf(stderr, "Unexpected vnni_rows block %d x %d!\n", rows, cols);
+    }
+#undef VNNI_ROWS_CALL
+}
+
+// GGML_AMX_VNNI_CHECK=1 recomputes every row with the M == 1 kernel and reports differences (slow; for testing).
+static bool vnni_rows_check() {
+    static const bool v = getenv("GGML_AMX_VNNI_CHECK") != nullptr;
+    return v;
+}
+
+static void vnni_rows_compare(const float * ref, const float * got, int n, int M, int N, int K) {
+    static std::atomic<long> checked{0}, bad{0};
+    float worst = 0;
+    for (int j = 0; j < n; ++j) {
+        const float d = std::fabs(ref[j] - got[j]) / (std::fabs(ref[j]) + 1e-3f);
+        worst = std::max(worst, d);
+    }
+    const long c = ++checked;
+    if (worst > 1e-4f && bad++ < 20) {
+        fprintf(stderr, "vnni_rows MISMATCH M=%d N=%d K=%d rel=%g ref=%g got=%g\n", M, N, K, worst, ref[0], got[0]);
+    }
+    if ((c & (c - 1)) == 0 && c >= 1024) {
+        fprintf(stderr, "vnni_rows checked %ld rows x 32, mismatches %ld\n", c, bad.load());
+    }
+}
+
+// Largest M sent to the multi-row kernels (GGML_AMX_VNNI_MAX_M; 0 or 1 disables them). Rows go 8 at a time.
+static int vnni_rows_max_m() {
+    static const int v = [] {
+        const char * s = getenv("GGML_AMX_VNNI_MAX_M");
+        return s ? atoi(s) : 8;
+    }();
+    return v;
+}
+
 #define LAUNCH_TINYGEMM_KERNEL_VNNI(NB_SIZE)                                                   \
     tinygemm_kernel_vnni<vec_dot_type, type, float, 1, NB_SIZE, blck_size>::apply(             \
         KB, wdata_batch,                                                                       \
@@ -2431,6 +2606,60 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
  // }
 
     ggml_barrier(params->threadpool);
+
+    // small batches of Q4_0 / Q8_0: multi-row VNNI kernels (vnni_rows.inc) instead of AMX tiles
+    if (M > 1 && M <= vnni_rows_max_m() && (TYPE == GGML_TYPE_Q4_0 || TYPE == GGML_TYPE_Q8_0)) {
+        constexpr int BLOCK_N = TILE_N * 4;
+        const int NB = div_up(N, BLOCK_N);
+
+        parallel_for_ggml(params, n_batch * NB, [&](int begin, int end) {
+            GGML_DISPATCH_QTYPES(TYPE, [&] {
+                if constexpr (std::is_same<type, block_q4_0>::value || std::is_same<type, block_q8_0>::value) {
+                    const int KB = K / blck_size;
+                    const int TILE_SIZE = get_tile_size<type>();
+                    const int row_size_A = KB * sizeof(vec_dot_type);
+                    static thread_local std::vector<int32_t> acomp;
+                    int64_t prepared = -1;
+                    for (int i = begin; i < end; ++i) {
+                        const int batch_idx = i / NB;
+                        const int nb = i % NB;
+                        const int64_t src0_offset = ggml_batch_offset(src0, batch_idx, ne2);
+                        const int64_t dst_offset  = ggml_batch_offset(dst,  batch_idx, ne2);
+                        const char * wdata_batch = (const char *)wdata + batch_idx * M * row_size_A;
+                        if (std::is_same<type, block_q4_0>::value && prepared != batch_idx) {
+                            acomp.resize((size_t)M * KB);
+                            vnni_rows_prepare((const block_q8_0 *)wdata_batch, M * KB, acomp.data());
+                            prepared = batch_idx;
+                        }
+                        const int nb_start = nb * BLOCK_N;
+                        const int tiles = std::min(BLOCK_N, N - nb_start) / TILE_N;
+                        const int cols = M <= 4 && tiles == 4 ? 64 : 32;  // 4 rows x 64 or 8 rows x 32 columns per call
+                        const int rows_per_call = cols == 64 ? 4 : VNNI_ROWS_MAX;
+                        for (int t = 0; t < tiles; t += cols / TILE_N) {
+                            const char * B = (const char *)src0->data + src0_offset + PACKED_INDEX((nb * 4 + t), 0, KB, TILE_SIZE);  // the macro does not parenthesize n
+                            for (int m0 = 0; m0 < M; m0 += rows_per_call) {
+                                const int rows = std::min(rows_per_call, M - m0);
+                                const block_q8_0 * A = (const block_q8_0 *)(wdata_batch + m0 * row_size_A);
+                                float * C = (float *)dst->data + dst_offset + m0 * ldc + nb_start + t * TILE_N;
+                                vnni_rows<type>(rows, cols, KB, A, acomp.data() + m0 * KB, B, C, ldc);
+                                if (vnni_rows_check()) {  // GGML_AMX_VNNI_CHECK=1: compare with the M == 1 kernel
+                                    for (int r = 0; r < rows; ++r) {
+                                        for (int h = 0; h < cols; h += 32) {
+                                            alignas(64) float ref[32];
+                                            tinygemm_kernel_vnni<vec_dot_type, type, float, 1, 32, blck_size>::apply(
+                                                KB, A + r * KB, B + PACKED_INDEX((h / TILE_N), 0, KB, TILE_SIZE), ref, 32);
+                                            vnni_rows_compare(ref, C + r * ldc + h, 32, M, N, K);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        });
+        return;
+    }
 
     if (M == 1) {
         // MB = 1 and handle 8 tiles in each block
