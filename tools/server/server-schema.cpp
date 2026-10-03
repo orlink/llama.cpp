@@ -34,6 +34,10 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             ctx.params.speculative.copy.text = data.at("copy_text").get<std::string>();
         }));
 
+    add((new field_bool("copy_prompt", params.speculative.copy.in_prompt))
+        ->set_desc("copy-transcript drafter: draft copy_text in the prompt pass too (default: --spec-copy-prompt); worth it "
+                   "when the server is otherwise idle, since it enlarges the prompt pass"));
+
     add((new field_bool("cache_prompt", params.cache_prompt))
         ->set_desc("Re-use KV cache from a previous request if possible. This way the common prefix does not have to be re-processed, only the suffix that differs between the requests"));
 

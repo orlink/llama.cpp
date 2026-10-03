@@ -3590,10 +3590,11 @@ private:
 
                         slot.init_sampler();
 
-                        // copy-transcript (--spec-copy-prompt): draft the request's copy_text right after the prompt,
+                        // copy-transcript (--spec-copy-prompt, or the request's "copy_prompt"): draft the request's
+                        // copy_text right after the prompt,
                         // in the same batch; the last prompt token's logits check its first token, so a short answer
                         // that matches is done in one pass. The usual verification (post_decode) accepts or rolls back.
-                        if (params_base.speculative.copy.in_prompt && slot.can_speculate() && !has_mtmd &&
+                        if (slot.task->params.speculative.copy.in_prompt && slot.can_speculate() && !has_mtmd &&
                                 !slot.task->params.speculative.copy.text.empty() && !slot.task->is_parent() &&
                                 ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
                                 ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
