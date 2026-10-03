@@ -1340,7 +1340,7 @@ struct tinygemm_kernel_avx<float, ggml_fp16_t, float, BLOCK_M, BLOCK_N, BLOCK_K>
 
 
 // re-organize in the format {NB, KB, TILE_SIZE}:
-#define PACKED_INDEX(n, k, KB, tile_size) (n * KB + k) * tile_size
+#define PACKED_INDEX(n, k, KB, tile_size) (((n) * (KB) + (k)) * (tile_size))
 
 template<typename TB, int BLOCK_K>
 void convert_B_packed_format(void * RESTRICT packed_B, const TB * RESTRICT B, int N, int K) {
