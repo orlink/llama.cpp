@@ -10,6 +10,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string>
+#include <cstring>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -279,6 +280,51 @@ static int test_quantize_imatrix_degenerate(bool verbose) {
     return num_failed;
 }
 
+// x86: the CPU's Q8_K quantization (the activations of the K-quant dot products) must match the reference bit for
+// bit, including ties in magnitude (the first value with the largest magnitude sets the sign of the scale), halves
+// (rounded to nearest even) and all-zero blocks.
+static int test_q8_K_matches_reference(bool verbose) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    const int64_t qk = ggml_blck_size(GGML_TYPE_Q8_K);
+    const int64_t n = 16 * qk;
+    std::vector<float> x(n);
+    for (int64_t i = 0; i < n; ++i) {
+        const int64_t b = i / qk;
+        const float t = 0.1f + 2.0f*cosf(i + 0.3f*b);
+        switch (b % 4) {
+            case 0: x[i] = t; break;
+            case 1: x[i] = (i % 7 == 3) ? ((i / 7) % 2 ? 1.5f : -1.5f) : 0.25f*t; break;  // ties: +-1.5 several times
+            case 2: x[i] = 0.5f*(int)(254.0f*cosf(0.37f*i)); break;                      // values that land on halves
+            case 3: x[i] = (b == 3) ? 0.0f : t*expf((float)(i % 9) - 4.0f); break;       // block 3 all zero, wide range
+        }
+    }
+    const auto * qfns = ggml_get_type_traits(GGML_TYPE_Q8_K);
+    const auto * qfns_cpu = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+    const size_t bs = ggml_type_size(GGML_TYPE_Q8_K);  // float d, int8 qs[qk], int16 bsums[qk / 16]
+    std::vector<uint8_t> ref(ggml_row_size(GGML_TYPE_Q8_K, n)), got(ref.size());
+    qfns->from_float_ref(x.data(), ref.data(), n);
+    qfns_cpu->from_float(x.data(), got.data(), n);
+    int bad = 0;
+    for (size_t b = 0; b < ref.size() / bs; ++b) {
+        const uint8_t * r = ref.data() + b*bs;
+        const uint8_t * g = got.data() + b*bs;
+        float d;
+        memcpy(&d, r, sizeof(float));
+        // the reference leaves the sums of all-zero blocks unset
+        const size_t cmp = d == 0.0f ? sizeof(float) + qk : bs;
+        bad += memcmp(r, g, cmp) != 0;
+    }
+    const bool failed = bad != 0;
+    if (failed || verbose) {
+        printf("   q8_K quantization matches the reference:  %s (%d of %zu blocks differ)\n", RESULT_STR[failed], bad, ref.size() / bs);
+    }
+    return failed;
+#else
+    GGML_UNUSED(verbose);
+    return 0;
+#endif
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
 
@@ -301,6 +347,7 @@ int main(int argc, char * argv[]) {
     num_failed += test_vec_dot_f32(verbose);
     num_failed += test_vec_dot_q(verbose);
     num_failed += test_quantize_imatrix_degenerate(verbose);
+    num_failed += test_q8_K_matches_reference(verbose);
 
     if (num_failed || verbose) {
         printf("%d tests failed\n", num_failed);

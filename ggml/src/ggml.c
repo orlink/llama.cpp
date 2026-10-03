@@ -882,6 +882,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .blck_size                = QK_K,
         .type_size                = sizeof(block_q8_K),
         .is_quantized             = true,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q8_K_ref,
     },
     [GGML_TYPE_BF16] = {
         .type_name                = "bf16",

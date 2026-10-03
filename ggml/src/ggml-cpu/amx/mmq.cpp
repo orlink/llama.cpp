@@ -294,30 +294,6 @@ inline void transpose_8x8_32bit(__m256i * v, __m256i * v1) {
     v1[7] = _mm256_permute2f128_si256(v[7], v[5], 0x13);
 }
 
-inline void transpose_16x4_32bit(__m512i * r, __m512i * d) {
-
-    static const __m512i index1 = _mm512_set_epi32(
-        0x0f, 0x0b, 0x07, 0x03,
-        0x0e, 0x0a, 0x06, 0x02,
-        0x0d, 0x09, 0x05, 0x01,
-        0x0c, 0x08, 0x04, 0x00);
-
-    d[0] = _mm512_permutexvar_epi32(index1, r[0]);
-    d[1] = _mm512_permutexvar_epi32(index1, r[1]);
-    d[2] = _mm512_permutexvar_epi32(index1, r[2]);
-    d[3] = _mm512_permutexvar_epi32(index1, r[3]);
-
-    r[0] = _mm512_shuffle_i32x4(d[0], d[1], 0x44);
-    r[1] = _mm512_shuffle_i32x4(d[0], d[1], 0xee);
-    r[2] = _mm512_shuffle_i32x4(d[2], d[3], 0x44);
-    r[3] = _mm512_shuffle_i32x4(d[2], d[3], 0xee);
-
-    d[0] = _mm512_shuffle_i32x4(r[0], r[2], 0x88);
-    d[1] = _mm512_shuffle_i32x4(r[0], r[2], 0xdd);
-    d[2] = _mm512_shuffle_i32x4(r[1], r[3], 0x88);
-    d[3] = _mm512_shuffle_i32x4(r[1], r[3], 0xdd);
-}
-
 inline void transpose_16x16_32bit(__m512i * v) {
     __m512i v1[16];
     v1[0] = _mm512_unpacklo_epi32(v[0], v[1]);
@@ -389,70 +365,6 @@ inline void transpose_16x16_32bit(__m512i * v) {
     v[15] = _mm512_shuffle_i32x4(v1[7], v1[15], 0xdd);
 }
 
-void quantize_row_q8_K_vnni(const float * RESTRICT x, void * RESTRICT vy, int64_t k) {
-    assert(k % QK_K == 0);
-    const int KB = k / QK_K;
-    constexpr int kVecs = QK_K / 16;
-
-    block_q8_K * y = reinterpret_cast<block_q8_K *>(vy);
-
-    // hold 16 float vecs from x
-    __m512  v[kVecs];
-
-    // hold the quants vecs
-    __m512i vq[kVecs / 4];
-
-    // hold the packed quants vecs
-    __m512i vq_packed[kVecs / 4];
-
-    const __m512 signBit = _mm512_set1_ps(-0.f);
-
-    for (int i = 0; i < KB; ++i) {
-        // Compute max(abs(e)) for the block
-        __m512 vamax = _mm512_set1_ps(0.f);
-        for (int j = 0; j < kVecs; ++j) {
-            v[j] = _mm512_loadu_ps(x); x += 16;
-            vamax = _mm512_max_ps(vamax, _mm512_andnot_ps(signBit, v[j]));
-        }
-        const float amax = _mm512_reduce_max_ps(vamax);
-
-        // Quantize these floats
-        const float iscale = 127.f / amax;
-        y[i].d = GGML_CPU_FP32_TO_FP16(1 / iscale);
-        const float id = ( amax != 0.0f ) ? iscale : 0.f;
-        const __m512 vscale = _mm512_set1_ps(id);
-
-        // Apply multiplier and round to nearest integer
-        for (int j = 0; j < kVecs; ++j) {
-            v[j] = _mm512_mul_ps(v[j], vscale);
-            v[j] = _mm512_roundscale_ps(v[j], (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-        }
-
-        // Pack to epi8 vecs
-        for (int j = 0; j < kVecs / 4; ++j) {
-            __m128i q8_0 = _mm512_cvtepi32_epi8(_mm512_cvtps_epi32(v[j * 4 + 0]));
-            __m128i q8_1 = _mm512_cvtepi32_epi8(_mm512_cvtps_epi32(v[j * 4 + 1]));
-            __m128i q8_2 = _mm512_cvtepi32_epi8(_mm512_cvtps_epi32(v[j * 4 + 2]));
-            __m128i q8_3 = _mm512_cvtepi32_epi8(_mm512_cvtps_epi32(v[j * 4 + 3]));
-
-            __m256i q8_01 = _mm256_insertf128_si256(_mm256_castsi128_si256(q8_0), (q8_1), 1);
-            __m256i q8_23 = _mm256_insertf128_si256(_mm256_castsi128_si256(q8_2), (q8_3), 1);
-
-            vq[j] = _mm512_inserti32x8(_mm512_castsi256_si512(q8_01), q8_23, 1);
-            _mm512_storeu_si512((__m512i *)(y[i].qs + j * 64), vq[j]);
-        }
-
-        // Compute the bsums with vnni
-        transpose_16x4_32bit(vq, vq_packed);
-
-        const __m512i one = _mm512_set1_epi8(1);
-        __m512i sum = _mm512_setzero_si512();
-        for (int k = 0; k < 4; ++k) {
-            sum = _mm512_dpbusd_epi32(sum, one, vq_packed[k]);
-        }
-        _mm256_storeu_si256((__m256i *)(y[i].bsums), _mm512_cvtepi32_epi16(sum));
-    }
-}
 
 // quantize A from float to `vec_dot_type`
 template <typename T>
@@ -470,12 +382,7 @@ inline void from_float<block_q8_1>(const float * x, char * vy, int64_t k) {
 
 template <>
 inline void from_float<block_q8_K>(const float * x, char * vy, int64_t k) {
-#if 1
-    // TODO: this is reference impl!
-    quantize_row_q8_K_ref(x, (block_q8_K *)vy, k);
-#else
-    quantize_row_q8_K_vnni(x, vy, k);
-#endif
+    quantize_row_q8_K(x, vy, k);
 }
 
 // load A from memory to array when nrows can not fill in whole tile

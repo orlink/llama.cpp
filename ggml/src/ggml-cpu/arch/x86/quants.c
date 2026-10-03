@@ -501,9 +501,106 @@ void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
 #endif
 }
 
-// placeholder implementation for Apple targets
-void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
-    quantize_row_q8_K_ref(x, y, k);
+// Same results as quantize_row_q8_K_ref, bit for bit: the scale comes from the first value with the largest
+// magnitude (its sign included), iscale = -127/max, products rounded to nearest even (as nearest_int), d = 1/iscale,
+// sums per 16 values. All-zero blocks get d = 0 and zero quants and sums.
+void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+    block_q8_K * GGML_RESTRICT y = vy;
+
+#if defined(__AVX512F__)
+    const __m512 signBit = _mm512_set1_ps(-0.0f);
+    for (int64_t i = 0; i < nb; i++, x += QK_K) {
+        __m512 v[QK_K/16];
+        __m512 maxAbs = _mm512_setzero_ps();
+        for (int j = 0; j < QK_K/16; ++j) {
+            v[j] = _mm512_loadu_ps(x + 16*j);
+            maxAbs = _mm512_max_ps(maxAbs, _mm512_andnot_ps(signBit, v[j]));
+        }
+        const float amax = _mm512_reduce_max_ps(maxAbs);
+        if (amax == 0.0f) {
+            y[i].d = 0;
+            memset(y[i].qs, 0, sizeof(y[i].qs));
+            memset(y[i].bsums, 0, sizeof(y[i].bsums));
+            continue;
+        }
+        // the first value whose magnitude is amax, as the reference's scan picks it
+        const __m512 vamax = _mm512_set1_ps(amax);
+        float max = 0.0f;
+        for (int j = 0; j < QK_K/16; ++j) {
+            const __mmask16 m = _mm512_cmp_ps_mask(_mm512_andnot_ps(signBit, v[j]), vamax, _CMP_EQ_OQ);
+            if (m) {
+                int l = 0;
+                while (!((m >> l) & 1)) l++;
+                max = x[16*j + l];
+                break;
+            }
+        }
+        const float iscale = -127.f/max;
+        const __m512 mul = _mm512_set1_ps(iscale);
+        for (int j = 0; j < QK_K/16; ++j) {
+            const __m512i q = _mm512_cvtps_epi32(_mm512_mul_ps(v[j], mul)); // rounding: nearest even
+            _mm_storeu_si128((__m128i *)(y[i].qs + 16*j), _mm512_cvtsepi32_epi8(q));
+            y[i].bsums[j] = (int16_t) _mm512_reduce_add_epi32(q);
+        }
+        y[i].d = 1/iscale;
+    }
+#elif defined(__AVX2__)
+    const __m256 signBit = _mm256_set1_ps(-0.0f);
+    const __m256i perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+    for (int64_t i = 0; i < nb; i++, x += QK_K) {
+        __m256 maxAbs = _mm256_setzero_ps();
+        for (int j = 0; j < QK_K/8; ++j) {
+            maxAbs = _mm256_max_ps(maxAbs, _mm256_andnot_ps(signBit, _mm256_loadu_ps(x + 8*j)));
+        }
+        __m128 max4 = _mm_max_ps(_mm256_extractf128_ps(maxAbs, 1), _mm256_castps256_ps128(maxAbs));
+        max4 = _mm_max_ps(max4, _mm_movehl_ps(max4, max4));
+        max4 = _mm_max_ss(max4, _mm_movehdup_ps(max4));
+        const float amax = _mm_cvtss_f32(max4);
+        if (amax == 0.0f) {
+            y[i].d = 0;
+            memset(y[i].qs, 0, sizeof(y[i].qs));
+            memset(y[i].bsums, 0, sizeof(y[i].bsums));
+            continue;
+        }
+        // the first value whose magnitude is amax, as the reference's scan picks it
+        const __m256 vamax = _mm256_set1_ps(amax);
+        float max = 0.0f;
+        for (int j = 0; j < QK_K/8; ++j) {
+            const int m = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_andnot_ps(signBit, _mm256_loadu_ps(x + 8*j)), vamax, _CMP_EQ_OQ));
+            if (m) {
+                int l = 0;
+                while (!((m >> l) & 1)) l++;
+                max = x[8*j + l];
+                break;
+            }
+        }
+        const float iscale = -127.f/max;
+        const __m256 mul = _mm256_set1_ps(iscale);
+        for (int j = 0; j < QK_K/32; ++j) {
+            // rounding: nearest even
+            const __m256i i0 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + 32*j +  0), mul));
+            const __m256i i1 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + 32*j +  8), mul));
+            const __m256i i2 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + 32*j + 16), mul));
+            const __m256i i3 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + 32*j + 24), mul));
+            // sums of the two groups of 16 values (i0 + i1, i2 + i3)
+            const __m256i h  = _mm256_hadd_epi32(_mm256_add_epi32(i0, i1), _mm256_add_epi32(i2, i3));
+            const __m256i h2 = _mm256_hadd_epi32(h, h);
+            const __m128i s  = _mm_add_epi32(_mm256_castsi256_si128(h2), _mm256_extracti128_si256(h2, 1));
+            y[i].bsums[2*j + 0] = (int16_t) _mm_extract_epi32(s, 0);
+            y[i].bsums[2*j + 1] = (int16_t) _mm_extract_epi32(s, 1);
+            // int32 -> int8; the packs work per 128-bit lane, the permute restores the order
+            const __m256i p = _mm256_packs_epi16(_mm256_packs_epi32(i0, i1), _mm256_packs_epi32(i2, i3));
+            _mm256_storeu_si256((__m256i *)(y[i].qs + 32*j), _mm256_permutevar8x32_epi32(p, perm));
+        }
+        y[i].d = 1/iscale;
+    }
+#else
+    GGML_UNUSED(nb);
+    GGML_UNUSED(y);
+    quantize_row_q8_K_ref(x, vy, k);
+#endif
 }
 
 //===================================== Dot products =================================
