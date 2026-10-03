@@ -101,8 +101,11 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
 
         // for expert layers, we use normal FFN as shared expert (same as python code)
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff_cur}, 0);
-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff_cur}, 0);
+        layer.ffn_gate_up = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP, "weight", i), {n_embd, 2 * n_ff_cur}, TENSOR_NOT_REQUIRED);
+        if (!layer.ffn_gate_up) {
+            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff_cur}, 0);
+            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff_cur}, 0);
+        }
         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff_cur, n_embd}, 0);
         layer.ffn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), {n_embd}, 0);
 
@@ -348,12 +351,22 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
                     LLM_NORM_RMS, il);
             cb(cur, "ffn_norm", il);
 
-            cur = build_ffn(cur,
-                    model.layers[il].ffn_up,   nullptr, model.layers[il].ffn_up_s,
-                    model.layers[il].ffn_gate, nullptr, model.layers[il].ffn_gate_s,
-                    model.layers[il].ffn_down, nullptr, model.layers[il].ffn_down_s,
-                    nullptr,
-                    LLM_FFN_GELU, LLM_FFN_PAR, il);
+            if (model.layers[il].ffn_gate_up) {
+                // gate and up in one product: gelu(first half) * second half
+                cur = build_ffn(cur,
+                        model.layers[il].ffn_gate_up, nullptr, nullptr,
+                        nullptr, nullptr, nullptr,
+                        model.layers[il].ffn_down, nullptr, model.layers[il].ffn_down_s,
+                        nullptr,
+                        LLM_FFN_GEGLU, LLM_FFN_SEQ, il);
+            } else {
+                cur = build_ffn(cur,
+                        model.layers[il].ffn_up,   nullptr, model.layers[il].ffn_up_s,
+                        model.layers[il].ffn_gate, nullptr, model.layers[il].ffn_gate_s,
+                        model.layers[il].ffn_down, nullptr, model.layers[il].ffn_down_s,
+                        nullptr,
+                        LLM_FFN_GELU, LLM_FFN_PAR, il);
+            }
             cb(cur, "ffn_out", il);
         }
         cur = build_norm(cur,
