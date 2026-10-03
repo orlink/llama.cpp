@@ -573,7 +573,128 @@ struct ggml_state {
 
 static struct ggml_state g_state = {0};
 
+// GGML_NODE_WAIT=1: for every graph node, each thread's working time and its waiting at barriers (inside the node,
+// e.g. after a matrix product's activation step, and after it), summed by node kind (operation; matrix products by
+// weight name) and printed to stderr at exit as milliseconds per graph. The smallest wait among the threads of a node
+// is the barrier's own cost; the rest is uneven work (threads waiting for the slowest one).
+#define NW_MAX_NODES 16384
+#define NW_MAX_THREADS 64
+#define NW_MAX_KINDS 96
+static _Thread_local double nw_barrier_ns;
+static float nw_work[NW_MAX_THREADS][NW_MAX_NODES];
+static float nw_wait[NW_MAX_THREADS][NW_MAX_NODES];
+static uint8_t nw_set[NW_MAX_NODES];
+static char nw_kind_name[NW_MAX_KINDS][48];
+static double nw_kind_work[NW_MAX_KINDS], nw_kind_wait[NW_MAX_KINDS], nw_kind_min[NW_MAX_KINDS], nw_kind_nodes[NW_MAX_KINDS];
+static int nw_kinds, nw_graphs, nw_nth;
+
+static int nw_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = getenv("GGML_NODE_WAIT") != NULL;
+    }
+    return v;
+}
+
+static inline double nw_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e9 + ts.tv_nsec;
+}
+
+static int nw_kind(const struct ggml_tensor * node, int fused) {
+    char name[48];
+    if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0]) {
+        const char * w = node->src[0]->name;
+        if (strncmp(w, "blk.", 4) == 0 && strchr(w + 4, '.')) {
+            w = strchr(w + 4, '.') + 1;
+        }
+        snprintf(name, sizeof(name), "mul_mat %s", w);
+        char * dot = strstr(name, ".weight");
+        if (dot) {
+            *dot = 0;
+        }
+    } else {
+        snprintf(name, sizeof(name), "%s%s", ggml_op_desc(node), fused ? " (fused)" : "");
+    }
+    for (int k = 0; k < nw_kinds; ++k) {
+        if (strcmp(nw_kind_name[k], name) == 0) {
+            return k;
+        }
+    }
+    if (nw_kinds == NW_MAX_KINDS - 1) {
+        return nw_kinds;
+    }
+    snprintf(nw_kind_name[nw_kinds], sizeof(nw_kind_name[0]), "%s", nw_kinds == NW_MAX_KINDS - 2 ? "other" : name);
+    return nw_kinds++;
+}
+
+static void nw_print(void) {
+    if (nw_graphs == 0) {
+        return;
+    }
+    int order[NW_MAX_KINDS];
+    double work = 0, wait = 0, min = 0;
+    for (int k = 0; k < nw_kinds; ++k) {
+        order[k] = k;
+        work += nw_kind_work[k]; wait += nw_kind_wait[k]; min += nw_kind_min[k];
+    }
+    for (int a = 0; a < nw_kinds; ++a) {
+        for (int b = a + 1; b < nw_kinds; ++b) {
+            if (nw_kind_wait[order[b]] > nw_kind_wait[order[a]]) {
+                int t = order[a]; order[a] = order[b]; order[b] = t;
+            }
+        }
+    }
+    const double f = 1e-6 / nw_graphs / nw_nth;  // ns summed over threads -> ms per graph, mean thread
+    fprintf(stderr, "node-wait: %d graphs, %d threads; ms per graph (mean thread): work %.2f, waiting %.2f (barrier cost %.2f, uneven work %.2f)\n",
+            nw_graphs, nw_nth, work * f, wait * f, min * f, (wait - min) * f);
+    fprintf(stderr, "node-wait: %-34s %7s %8s %8s %8s %8s\n", "kind", "nodes", "work", "waiting", "barrier", "uneven");
+    for (int a = 0; a < nw_kinds; ++a) {
+        const int k = order[a];
+        fprintf(stderr, "node-wait: %-34s %7.1f %8.3f %8.3f %8.3f %8.3f\n", nw_kind_name[k], nw_kind_nodes[k] / nw_graphs,
+                nw_kind_work[k] * f, nw_kind_wait[k] * f, nw_kind_min[k] * f, (nw_kind_wait[k] - nw_kind_min[k]) * f);
+    }
+}
+
+// thread 0, after the graph's last barrier
+static void nw_collect(const struct ggml_cgraph * cgraph, int nth) {
+    if (nw_graphs == 0) {
+        atexit(nw_print);
+    }
+    nw_graphs++;
+    nw_nth = nth;
+    const int n = cgraph->n_nodes < NW_MAX_NODES ? cgraph->n_nodes : NW_MAX_NODES;
+    for (int i = 0; i < n; ++i) {
+        if (!nw_set[i]) {
+            continue;
+        }
+        const int k = nw_kind(cgraph->nodes[i], nw_set[i] > 1);
+        double mn = 1e30;
+        for (int t = 0; t < nth; ++t) {
+            nw_kind_work[k] += nw_work[t][i];
+            nw_kind_wait[k] += nw_wait[t][i];
+            mn = nw_wait[t][i] < mn ? nw_wait[t][i] : mn;
+        }
+        nw_kind_min[k] += mn * nth;
+        nw_kind_nodes[k] += 1;
+        nw_set[i] = 0;
+    }
+}
+
+static void ggml_barrier_impl(struct ggml_threadpool * tp);
+
 void ggml_barrier(struct ggml_threadpool * tp) {
+    if (nw_enabled()) {
+        const double t = nw_now();
+        ggml_barrier_impl(tp);
+        nw_barrier_ns += nw_now() - t;
+        return;
+    }
+    ggml_barrier_impl(tp);
+}
+
+static void ggml_barrier_impl(struct ggml_threadpool * tp) {
     int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
     if (n_threads == 1) {
         return;
@@ -3120,8 +3241,16 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    const int nw = nw_enabled() && params.nth <= NW_MAX_THREADS;
+    int nw_last = -1;
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
+        const int nw_node = node_n;
+        double nw_t0 = 0, nw_b0 = 0;
+        if (nw) {
+            nw_t0 = nw_now();
+            nw_b0 = nw_barrier_ns;
+        }
 
         if (ggml_op_is_empty(node->op)) {
             // skip NOPs
@@ -3147,6 +3276,21 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             tp->ec    = GGML_STATUS_ABORTED;
         }
 
+        if (nw && nw_node < NW_MAX_NODES) {
+            const double t1 = nw_now();
+            const double inner = nw_barrier_ns - nw_b0;
+            if (node_n + 1 < cgraph->n_nodes) {
+                ggml_barrier(state->threadpool);
+            }
+            nw_work[state->ith][nw_node] = (float) (t1 - nw_t0 - inner);
+            nw_wait[state->ith][nw_node] = (float) (inner + (nw_now() - t1));
+            if (state->ith == 0) {
+                nw_set[nw_node] = n_fused > 0 ? 2 : 1;
+            }
+            nw_last = nw_node;
+            continue;
+        }
+
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
         }
@@ -3157,6 +3301,16 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #else
     GGML_PRINT_DEBUG("thread #%d compute-done cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
+
+    if (nw && nw_last >= 0) {
+        const double t = nw_now();
+        ggml_barrier(state->threadpool);
+        nw_wait[state->ith][nw_last] += (float) (nw_now() - t);
+        ggml_barrier(state->threadpool);
+        if (state->ith == 0) {
+            nw_collect(cgraph, params.nth);
+        }
+    }
 
     ggml_barrier(state->threadpool);
 

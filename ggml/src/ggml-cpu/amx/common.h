@@ -4,6 +4,7 @@
 #include "ggml-cpu-impl.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <type_traits>
 
@@ -100,6 +101,36 @@ inline void parallel_for_ggml(const ggml_compute_params * params, int n, const f
     int tbegin, tend;
     balance211(n, params->nth, params->ith, tbegin, tend);
     f(tbegin, tend);
+}
+
+// GGML_AMX_DYN=C (C > 0): the grouped-weight matrix products (g256 rows, AMX int8 copies) hand out their column blocks
+// from a shared counter, C blocks at a time, instead of one fixed range per thread, so a thread that finishes early
+// takes more work. 0 (default): fixed ranges (balance211).
+inline int amx_dyn_chunk() {
+    static const int v = [] {
+        const char * e = getenv("GGML_AMX_DYN");
+        return e ? atoi(e) : 0;
+    }();
+    return v;
+}
+
+// before the barrier that precedes a parallel_for_dyn loop: thread 0 resets the shared counter
+inline void parallel_for_dyn_prepare(const ggml_compute_params * params) {
+    if (amx_dyn_chunk() > 0 && params->ith == 0) {
+        ggml_threadpool_chunk_set(params->threadpool, params->nth);
+    }
+}
+
+template <typename func_t>
+inline void parallel_for_dyn(const ggml_compute_params * params, int n, const func_t & f) {
+    const int c = amx_dyn_chunk();
+    if (c <= 0) {
+        parallel_for_ggml(params, n, f);
+        return;
+    }
+    for (int k = params->ith; (int64_t) k * c < n; k = ggml_threadpool_chunk_add(params->threadpool, 1)) {
+        f(k * c, std::min(n, (k + 1) * c));
+    }
 }
 
 // quantized types that have AMX support

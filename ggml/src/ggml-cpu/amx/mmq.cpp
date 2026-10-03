@@ -3629,14 +3629,12 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
                     amx_i8g_quantize_row(x, y, as + (size_t) idx * NG, K, G);
                 }
             });
+            parallel_for_dyn_prepare(params);
             ggml_barrier(params->threadpool);
             const bool rows16 = M <= 16;              // one activation tile, 64 columns per task
             const int NB = rows16 ? div_up(N, 64) : N / 32;
-            parallel_for_ggml(params, n_batch * NB, [&](int begin, int end) {
-                if (begin >= end) {
-                    return;
-                }
-                amx_half_tile_config();
+            amx_half_tile_config();  // once per thread: with GGML_AMX_DYN the loop body runs once per chunk
+            parallel_for_dyn(params, n_batch * NB, [&](int begin, int end) {
                 for (int i = begin; i < end; ++i) {
                     const int batch_idx = i / NB;
                     const int nb = i % NB;
@@ -3666,8 +3664,8 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
                         }
                     }
                 }
-                amx_int8_tile_config_restore();
             });
+            amx_int8_tile_config_restore();
             return;
         }
     }
@@ -3690,9 +3688,10 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
                     g256_quantize_row(x, As + (size_t) idx * K, Au + (size_t) idx * K, as + (size_t) idx * NG, asum + (size_t) idx * NG, K, G);
                 }
             });
+            parallel_for_dyn_prepare(params);
             ggml_barrier(params->threadpool);
             const int NB = div_up(N, 64);
-            parallel_for_ggml(params, n_batch * NB, [&](int begin, int end) {
+            parallel_for_dyn(params, n_batch * NB, [&](int begin, int end) {
                 for (int i = begin; i < end; ++i) {
                     const int batch_idx = i / NB;
                     const int nb = i % NB;
