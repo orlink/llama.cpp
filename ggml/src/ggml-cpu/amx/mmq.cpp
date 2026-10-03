@@ -12,6 +12,7 @@
 #include "ggml-quants.h"
 #include <algorithm>
 #include <type_traits>
+#include <vector>
 
 #if defined(__gnu_linux__)
 #include <sys/syscall.h>
@@ -1983,6 +1984,307 @@ struct tinygemm_kernel_vnni<block_q8_K, block_iq4_xs, float, BLOCK_M, BLOCK_N, B
     }
 };
 
+// Multi-row VNNI kernels for small batches (2 .. TINYGEMM_ROWS_MAX rows).
+//
+// The VNNI kernels above handle one row; every M >= 2 goes to the AMX tile kernel, which costs a fixed overhead per
+// weight block (tile multiply, store, rescale with AVX512, and unpacking for the 4/5/6-bit types) and is slow for a
+// handful of rows, e.g. speculative decoding or a few parallel sequences. These kernels read the same packed layouts
+// as the one-row kernels and multiply each weight vector they load with several activation rows.
+//
+// Each row keeps NACC independent sums per sub-block: a single sum is a chain of dependent VNNI instructions, and
+// with only a few rows the core waits on those chains.
+
+constexpr int TINYGEMM_ROWS_MAX = 8;
+
+// Q4_0 weights: unsigned nibbles (u8) x signed activations (s8), minus 8 * sum(a) per block (acomp, precomputed).
+template <int ROWS, int BLOCK_N>
+static void tinygemm_rows_q4_0(int KB, const block_q8_0 * RESTRICT A, const int32_t * RESTRICT acomp,
+                               const char * RESTRICT B, float * RESTRICT C, int ldc) {
+    constexpr int COLS = BLOCK_N / 16;
+    const int TILE_SIZE = TILE_N * sizeof(block_q4_0);
+    const __m512i lowMask = _mm512_set1_epi8(0xF);
+
+    __m512 vc[ROWS][COLS];
+    for (int r = 0; r < ROWS; ++r)
+        for (int c = 0; c < COLS; ++c) vc[r][c] = _mm512_setzero_ps();
+
+    for (int i = 0; i < KB; ++i) {
+        for (int c = 0; c < COLS; ++c) {
+            const char * b_ptr = B + PACKED_INDEX(c, i, KB, TILE_SIZE);
+            __m512i vb[8];
+            for (int k = 0; k < 8; k += 2) {
+                const __m512i bytes = _mm512_loadu_si512((const __m512i *)(b_ptr + k * 32));
+                vb[k + 0] = _mm512_and_si512(bytes, lowMask);
+                vb[k + 1] = _mm512_and_si512(_mm512_srli_epi16(bytes, 4), lowMask);
+            }
+            const __m512 vd0 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(b_ptr + TILE_N * TILE_K / 2)));
+            for (int r = 0; r < ROWS; ++r) {
+                const block_q8_0 & a = A[r * KB + i];
+                const int32_t * a_ptr = reinterpret_cast<const int32_t *>(a.qs);
+                __m512i vsum = _mm512_setzero_si512();
+                for (int k = 0; k < 8; ++k) {
+                    vsum = _mm512_dpbusd_epi32(vsum, vb[k], _mm512_set1_epi32(a_ptr[k]));
+                }
+                vsum = _mm512_sub_epi32(vsum, _mm512_set1_epi32(acomp[r * KB + i]));
+                vc[r][c] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(vsum),
+                                           _mm512_mul_ps(vd0, _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a.d))), vc[r][c]);
+            }
+        }
+    }
+    for (int r = 0; r < ROWS; ++r)
+        for (int c = 0; c < COLS; ++c) _mm512_storeu_ps(C + r * ldc + c * 16, vc[r][c]);
+}
+
+// Q8_0 weights: (a + 128) as u8 x weights s8, minus 128 * sum(b) (packed with B), as the one-row kernel.
+template <int ROWS, int BLOCK_N>
+static void tinygemm_rows_q8_0(int KB, const block_q8_0 * RESTRICT A, const int32_t * RESTRICT /*acomp*/,
+                               const char * RESTRICT B, float * RESTRICT C, int ldc) {
+    constexpr int COLS = BLOCK_N / 16;
+    const int TILE_SIZE = TILE_N * sizeof(block_q8_0) + TILE_N * sizeof(int32_t);
+    const __m512i off = _mm512_set1_epi8(static_cast<char>(0x80));
+
+    __m512 vc[ROWS][COLS];
+    for (int r = 0; r < ROWS; ++r)
+        for (int c = 0; c < COLS; ++c) vc[r][c] = _mm512_setzero_ps();
+
+    for (int i = 0; i < KB; ++i) {
+        for (int r = 0; r < ROWS; ++r) {
+            const block_q8_0 & a = A[r * KB + i];
+            const int32_t * a_ptr = reinterpret_cast<const int32_t *>(a.qs);
+            __m512i va[8];
+            for (int k = 0; k < 8; ++k) va[k] = _mm512_add_epi8(_mm512_set1_epi32(a_ptr[k]), off);
+            const __m512 vd1 = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a.d));
+            for (int c = 0; c < COLS; ++c) {
+                const char * b_ptr = B + PACKED_INDEX(c, i, KB, TILE_SIZE);
+                __m512i vsum = _mm512_setzero_si512();
+                for (int k = 0; k < 8; ++k) {
+                    vsum = _mm512_dpbusd_epi32(vsum, va[k], _mm512_loadu_si512((const __m512i *)(b_ptr + k * 64)));
+                }
+                const __m512 vd0 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(b_ptr + TILE_N * TILE_K)));
+                const __m512i vcomp = _mm512_loadu_si512((const __m512i *)(b_ptr + TILE_N * TILE_K + TILE_N * sizeof(ggml_half)));
+                vsum = _mm512_sub_epi32(vsum, vcomp);
+                vc[r][c] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(vsum), _mm512_mul_ps(vd0, vd1), vc[r][c]);
+            }
+        }
+    }
+    for (int r = 0; r < ROWS; ++r)
+        for (int c = 0; c < COLS; ++c) _mm512_storeu_ps(C + r * ldc + c * 16, vc[r][c]);
+}
+
+// 8 * sum(a) of every 32-value block of the quantized activation rows (for Q4_0)
+static void tinygemm_rows_prepare_q4_0(const block_q8_0 * A, int n, int32_t * acomp) {
+    const __m256i flip = _mm256_set1_epi8(static_cast<char>(0x80));
+    for (int j = 0; j < n; ++j) {
+        const __m256i qu = _mm256_xor_si256(_mm256_loadu_si256((const __m256i *)A[j].qs), flip);
+        const __m256i s = _mm256_sad_epu8(qu, _mm256_setzero_si256());
+        acomp[j] = 8 * ((int32_t)(_mm256_extract_epi64(s, 0) + _mm256_extract_epi64(s, 1) +
+                                  _mm256_extract_epi64(s, 2) + _mm256_extract_epi64(s, 3)) - 32 * 128);
+    }
+}
+
+// sums of the Q8_K activation rows per 32 values (bsums are per 16), for the mins of Q4_K / Q5_K
+static void tinygemm_rows_prepare_qkk(const block_q8_K * A, int n, int16_t * bs32) {
+    for (int j = 0; j < n; ++j) {
+        for (int g = 0; g < 8; ++g) {
+            bs32[j * 8 + g] = (int16_t)(A[j].bsums[2 * g] + A[j].bsums[2 * g + 1]);
+        }
+    }
+}
+
+// Q4_K / Q5_K weights (QH: the 5th bit), ROWS rows x NT tiles of 16 columns. Packed layout of pack_B<block_q4_K> /
+// <block_q5_K>: per tile and 256-value block the low 4 bits in VNNI order (8 groups of 32 values x 4 vectors; vector
+// q holds dword 2q in its low and dword 2q + 1 in its high nibbles), for Q5_K the 5th bits as one 64-byte vector per
+// group (bit j = dword j), then 6-bit scales and mins, d and dmin. The 5th bit is added with a byte mask.
+template <bool QH, int ROWS, int NT, int NACC>
+static void tinygemm_rows_qkk(int KB, const block_q8_K * RESTRICT A, const int16_t * RESTRICT bs32,
+                              const char * RESTRICT B, float * RESTRICT C, int ldc) {
+    const int TILE_SIZE = TILE_N * (QH ? sizeof(block_q5_K) : sizeof(block_q4_K)) + TILE_N * 4;
+    constexpr int off_qh     = (QK_K / 2) * TILE_N;
+    constexpr int off_scales = off_qh + (QH ? (QK_K / 8) * TILE_N : 0);
+    constexpr int off_mins   = off_scales + 8 * TILE_N;
+    constexpr int off_d      = off_mins + 8 * TILE_N;
+    constexpr int off_dmin   = off_d + TILE_N * sizeof(ggml_half);
+    const __m512i low = _mm512_set1_epi8(0xF);
+    const __m512i sixteen = _mm512_set1_epi8(16);
+
+    __m512 vc[ROWS][NT];
+    for (int r = 0; r < ROWS; ++r)
+        for (int c = 0; c < NT; ++c) vc[r][c] = _mm512_setzero_ps();
+
+    for (int i = 0; i < KB; ++i) {
+        for (int c = 0; c < NT; ++c) {
+            const char * b = B + PACKED_INDEX(c, i, KB, TILE_SIZE);
+            __m512 acc[ROWS];
+            for (int r = 0; r < ROWS; ++r) acc[r] = _mm512_setzero_ps();
+#pragma GCC unroll 8
+            for (int g = 0; g < 8; ++g) {
+                __m512i hbits = _mm512_setzero_si512();
+                if constexpr (QH) hbits = _mm512_loadu_si512((const __m512i *)(b + off_qh + g * 64));
+                __m512i vsum[NACC][ROWS];
+                for (int s = 0; s < NACC; ++s)
+                    for (int r = 0; r < ROWS; ++r) vsum[s][r] = _mm512_setzero_si512();
+#pragma GCC unroll 4
+                for (int q = 0; q < 4; ++q) {
+                    const __m512i bytes = _mm512_loadu_si512((const __m512i *)(b + (g * 4 + q) * 64));
+                    __m512i vb0 = _mm512_and_si512(bytes, low);
+                    __m512i vb1 = _mm512_and_si512(_mm512_srli_epi16(bytes, 4), low);
+                    if constexpr (QH) {
+                        vb0 = _mm512_mask_add_epi8(vb0, _mm512_test_epi8_mask(hbits, _mm512_set1_epi8((char)(1 << (2 * q)))), vb0, sixteen);
+                        vb1 = _mm512_mask_add_epi8(vb1, _mm512_test_epi8_mask(hbits, _mm512_set1_epi8((char)(1 << (2 * q + 1)))), vb1, sixteen);
+                    }
+                    for (int r = 0; r < ROWS; ++r) {
+                        const int32_t * a = reinterpret_cast<const int32_t *>(A[r * KB + i].qs + g * 32 + q * 8);
+                        __m512i & u = vsum[(2 * q) % NACC][r];
+                        u = _mm512_dpbusd_epi32(u, vb0, _mm512_set1_epi32(a[0]));
+                        __m512i & w = vsum[(2 * q + 1) % NACC][r];
+                        w = _mm512_dpbusd_epi32(w, vb1, _mm512_set1_epi32(a[1]));
+                    }
+                }
+                const __m512 vscale = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(b + off_scales + g * TILE_N))));
+                for (int r = 0; r < ROWS; ++r) {
+                    __m512i t = vsum[0][r];
+                    for (int s = 1; s < NACC; ++s) t = _mm512_add_epi32(t, vsum[s][r]);
+                    acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(t), vscale, acc[r]);
+                }
+            }
+            // mins: int16 pairs (groups 2k, 2k + 1) per column x the activation sums of the same groups
+            __m512i accm[ROWS];
+            for (int r = 0; r < ROWS; ++r) accm[r] = _mm512_setzero_si512();
+            for (int k = 0; k < 4; ++k) {
+                const __m512i vm = _mm512_cvtepi8_epi16(_mm256_loadu_si256((const __m256i *)(b + off_mins + k * 32)));
+                for (int r = 0; r < ROWS; ++r) {
+                    const int32_t s = *reinterpret_cast<const int32_t *>(bs32 + (r * KB + i) * 8 + 2 * k);
+                    accm[r] = _mm512_dpwssd_epi32(accm[r], _mm512_set1_epi32(s), vm);
+                }
+            }
+            const __m512 vd0 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(b + off_d)));
+            const __m512 vdmin = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(b + off_dmin)));
+            for (int r = 0; r < ROWS; ++r) {
+                const __m512 v = _mm512_fmsub_ps(acc[r], vd0, _mm512_mul_ps(_mm512_cvtepi32_ps(accm[r]), vdmin));
+                vc[r][c] = _mm512_fmadd_ps(v, _mm512_set1_ps(A[r * KB + i].d), vc[r][c]);
+            }
+        }
+    }
+    for (int r = 0; r < ROWS; ++r)
+        for (int c = 0; c < NT; ++c) _mm512_storeu_ps(C + r * ldc + c * 16, vc[r][c]);
+}
+
+// Q6_K weights, ROWS rows x NT tiles. Packed layout of pack_B<block_q6_K>: per tile and 256-value block, 16 sub-blocks
+// of 16 values, each two vectors of low 4 bits (dwords 0 / 1 in the first, 2 / 3 in the second, low / high nibbles)
+// and one vector of high 2-bit pairs (bits 2j, 2j + 1 for dword j), then int8 scales per sub-block and d. The values
+// are q - 32: the 32 is subtracted once per block as 32 x sum(scale x activation sums of 16).
+template <int ROWS, int NT, int NACC>
+static void tinygemm_rows_q6_K(int KB, const block_q8_K * RESTRICT A, const char * RESTRICT B, float * RESTRICT C, int ldc) {
+    const int TILE_SIZE = TILE_N * sizeof(block_q6_K);
+    constexpr int off_qh     = (QK_K / 2) * TILE_N;
+    constexpr int off_scales = off_qh + (QK_K / 4) * TILE_N;
+    constexpr int off_d      = off_scales + 16 * TILE_N;
+    const __m512i low = _mm512_set1_epi8(0xF);
+    const __m512i m3 = _mm512_set1_epi8(0x3), m30 = _mm512_set1_epi8(0x30);
+
+    __m512 vc[ROWS][NT];
+    for (int r = 0; r < ROWS; ++r)
+        for (int c = 0; c < NT; ++c) vc[r][c] = _mm512_setzero_ps();
+
+    for (int i = 0; i < KB; ++i) {
+        for (int c = 0; c < NT; ++c) {
+            const char * b = B + PACKED_INDEX(c, i, KB, TILE_SIZE);
+            __m512 acc[ROWS];
+            for (int r = 0; r < ROWS; ++r) acc[r] = _mm512_setzero_ps();
+#pragma GCC unroll 4
+            for (int kg = 0; kg < QK_K / 16; ++kg) {
+                const __m512i bytes0 = _mm512_loadu_si512((const __m512i *)(b + kg * 128));
+                const __m512i bytes1 = _mm512_loadu_si512((const __m512i *)(b + kg * 128 + 64));
+                const __m512i hbits = _mm512_loadu_si512((const __m512i *)(b + off_qh + kg * 64));
+                __m512i vb[4];
+                vb[0] = _mm512_or_si512(_mm512_and_si512(bytes0, low), _mm512_slli_epi16(_mm512_and_si512(hbits, m3), 4));
+                vb[1] = _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi16(bytes0, 4), low), _mm512_and_si512(_mm512_slli_epi16(hbits, 2), m30));
+                vb[2] = _mm512_or_si512(_mm512_and_si512(bytes1, low), _mm512_and_si512(hbits, m30));
+                vb[3] = _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi16(bytes1, 4), low), _mm512_and_si512(_mm512_srli_epi16(hbits, 2), m30));
+                __m512i vsum[NACC][ROWS];
+                for (int s = 0; s < NACC; ++s)
+                    for (int r = 0; r < ROWS; ++r) vsum[s][r] = _mm512_setzero_si512();
+                for (int j = 0; j < 4; ++j) {
+                    for (int r = 0; r < ROWS; ++r) {
+                        const int32_t * a = reinterpret_cast<const int32_t *>(A[r * KB + i].qs + kg * 16);
+                        __m512i & u = vsum[j % NACC][r];
+                        u = _mm512_dpbusd_epi32(u, vb[j], _mm512_set1_epi32(a[j]));
+                    }
+                }
+                const __m512 vscale = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(b + off_scales + kg * TILE_N))));
+                for (int r = 0; r < ROWS; ++r) {
+                    __m512i t = vsum[0][r];
+                    for (int s = 1; s < NACC; ++s) t = _mm512_add_epi32(t, vsum[s][r]);
+                    acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(t), vscale, acc[r]);
+                }
+            }
+            // 32 x sum over sub-blocks of scale x activation sum (int16 pairs of sub-blocks 2k, 2k + 1)
+            __m512i comp[ROWS];
+            for (int r = 0; r < ROWS; ++r) comp[r] = _mm512_setzero_si512();
+            for (int k = 0; k < 8; ++k) {
+                const __m512i s0 = _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(b + off_scales + (2 * k) * TILE_N)));
+                const __m512i s1 = _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(b + off_scales + (2 * k + 1) * TILE_N)));
+                const __m512i vs = _mm512_or_si512(_mm512_and_si512(s0, _mm512_set1_epi32(0xFFFF)), _mm512_slli_epi32(s1, 16));
+                for (int r = 0; r < ROWS; ++r) {
+                    const int32_t bs = *reinterpret_cast<const int32_t *>(A[r * KB + i].bsums + 2 * k);
+                    comp[r] = _mm512_dpwssd_epi32(comp[r], _mm512_set1_epi32(bs), vs);
+                }
+            }
+            const __m512 vd0 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(b + off_d)));
+            for (int r = 0; r < ROWS; ++r) {
+                const __m512 v = _mm512_fnmadd_ps(_mm512_cvtepi32_ps(comp[r]), _mm512_set1_ps(32.0f), acc[r]);
+                vc[r][c] = _mm512_fmadd_ps(v, _mm512_mul_ps(vd0, _mm512_set1_ps(A[r * KB + i].d)), vc[r][c]);
+            }
+        }
+    }
+    for (int r = 0; r < ROWS; ++r)
+        for (int c = 0; c < NT; ++c) _mm512_storeu_ps(C + r * ldc + c * 16, vc[r][c]);
+}
+
+// Q4_0 / Q8_0: rows (1..8) x cols (64 for up to 4 rows, else 32) per call
+template <typename TB>
+static void tinygemm_rows_q40_q80(int rows, int cols, int KB, const block_q8_0 * A, const int32_t * acomp, const char * B,
+                                  float * C, int ldc) {
+#define ROWS_CALL(R, NC) \
+        if constexpr (std::is_same<TB, block_q4_0>::value) { tinygemm_rows_q4_0<R, NC>(KB, A, acomp, B, C, ldc); } \
+        else { tinygemm_rows_q8_0<R, NC>(KB, A, acomp, B, C, ldc); }
+    switch (rows * 100 + cols) {
+        case 164: ROWS_CALL(1, 64) break;
+        case 264: ROWS_CALL(2, 64) break;
+        case 364: ROWS_CALL(3, 64) break;
+        case 464: ROWS_CALL(4, 64) break;
+        case 132: ROWS_CALL(1, 32) break;
+        case 232: ROWS_CALL(2, 32) break;
+        case 332: ROWS_CALL(3, 32) break;
+        case 432: ROWS_CALL(4, 32) break;
+        case 532: ROWS_CALL(5, 32) break;
+        case 632: ROWS_CALL(6, 32) break;
+        case 732: ROWS_CALL(7, 32) break;
+        case 832: ROWS_CALL(8, 32) break;
+        default: fprintf(stderr, "Unexpected tinygemm_rows block %d x %d!\n", rows, cols);
+    }
+#undef ROWS_CALL
+}
+
+// K-quants: tiles of 16 columns per call by rows (from timings on Granite Rapids: 2 tiles for 3 and 5 rows, else 1)
+static inline int tinygemm_rows_tiles(int rows) { return rows == 3 || rows == 5 ? 2 : 1; }
+
+template <typename TB>
+static void tinygemm_rows_k(int rows, int nt, int KB, const block_q8_K * A, const int16_t * bs32, const char * B,
+                            float * C, int ldc) {
+#define ROWS_CASE(R, T, S) case R * 10 + T: \
+        if constexpr (std::is_same<TB, block_q6_K>::value) { tinygemm_rows_q6_K<R, T, S>(KB, A, B, C, ldc); } \
+        else { tinygemm_rows_qkk<std::is_same<TB, block_q5_K>::value, R, T, S>(KB, A, bs32, B, C, ldc); } \
+        break;
+    switch (rows * 10 + nt) {
+        ROWS_CASE(1, 1, 2) ROWS_CASE(2, 1, 2) ROWS_CASE(4, 1, 2) ROWS_CASE(6, 1, 2) ROWS_CASE(8, 1, 2)
+        ROWS_CASE(3, 2, 1) ROWS_CASE(5, 2, 1) ROWS_CASE(7, 1, 1)
+        ROWS_CASE(3, 1, 1) ROWS_CASE(5, 1, 1)  // the last tile of an odd tile count
+        default: fprintf(stderr, "Unexpected tinygemm_rows block %d x %d!\n", rows, nt);
+    }
+#undef ROWS_CASE
+}
+
 #define LAUNCH_TINYGEMM_KERNEL_VNNI(NB_SIZE)                                                   \
     tinygemm_kernel_vnni<vec_dot_type, type, float, 1, NB_SIZE, blck_size>::apply(             \
         KB, wdata_batch,                                                                       \
@@ -2431,6 +2733,75 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
  // }
 
     ggml_barrier(params->threadpool);
+
+    // small batches: multi-row VNNI kernels (each weight vector loaded once for all rows) instead of the AMX tile kernel
+    if (M > 1 && M <= TINYGEMM_ROWS_MAX) {
+        bool done = false;
+        GGML_DISPATCH_QTYPES(TYPE, [&] {
+            if constexpr (std::is_same<type, block_q4_0>::value || std::is_same<type, block_q8_0>::value ||
+                          std::is_same<type, block_q4_K>::value || std::is_same<type, block_q5_K>::value ||
+                          std::is_same<type, block_q6_K>::value) {
+                // Q8_0 reads twice the bytes of Q4_0 per row multiplied: from 5 rows the AMX tile kernel is as fast
+                if (std::is_same<type, block_q8_0>::value && M > 4) {
+                    return;
+                }
+                done = true;
+                constexpr int BLOCK_N = TILE_N * 4;
+                const int NB = div_up(N, BLOCK_N);
+                const int KB = K / blck_size;
+                const int TILE_SIZE = get_tile_size<type>();
+                const int row_size_A = KB * sizeof(vec_dot_type);
+                parallel_for_ggml(params, n_batch * NB, [&](int begin, int end) {
+                    static thread_local std::vector<int32_t> acomp;  // Q4_0: 8 * the activation sums per block
+                    static thread_local std::vector<int16_t> bs32;   // Q4_K / Q5_K: the activation sums per 32 values
+                    int64_t prepared = -1;
+                    for (int i = begin; i < end; ++i) {
+                        const int batch_idx = i / NB;
+                        const int nb = i % NB;
+                        const int64_t src0_offset = ggml_batch_offset(src0, batch_idx, ne2);
+                        const int64_t dst_offset  = ggml_batch_offset(dst,  batch_idx, ne2);
+                        const char * wdata_batch = (const char *)wdata + batch_idx * M * row_size_A;
+                        const int tiles = std::min(BLOCK_N, N - nb * BLOCK_N) / TILE_N;
+                        if constexpr (std::is_same<vec_dot_type, block_q8_0>::value) {
+                            if (std::is_same<type, block_q4_0>::value && prepared != batch_idx) {
+                                acomp.resize((size_t)M * KB);
+                                tinygemm_rows_prepare_q4_0((const block_q8_0 *)wdata_batch, M * KB, acomp.data());
+                                prepared = batch_idx;
+                            }
+                            const int cols = M <= 4 && tiles == 4 ? 64 : 32;  // 4 rows x 64 or 8 rows x 32 columns
+                            const int rows_per_call = cols == 64 ? 4 : TINYGEMM_ROWS_MAX;
+                            for (int t = 0; t < tiles; t += cols / TILE_N) {
+                                const char * B = (const char *)src0->data + src0_offset + PACKED_INDEX((nb * 4 + t), 0, KB, TILE_SIZE);
+                                for (int m0 = 0; m0 < M; m0 += rows_per_call) {
+                                    const int rows = std::min(rows_per_call, M - m0);
+                                    float * C = (float *)dst->data + dst_offset + m0 * ldc + nb * BLOCK_N + t * TILE_N;
+                                    tinygemm_rows_q40_q80<type>(rows, cols, KB, (const block_q8_0 *)(wdata_batch + m0 * row_size_A),
+                                                                acomp.data() + m0 * KB, B, C, ldc);
+                                }
+                            }
+                        } else {
+                            const block_q8_K * A = (const block_q8_K *)wdata_batch;
+                            if (!std::is_same<type, block_q6_K>::value && prepared != batch_idx) {
+                                bs32.resize((size_t)M * KB * 8);
+                                tinygemm_rows_prepare_qkk(A, M * KB, bs32.data());
+                                prepared = batch_idx;
+                            }
+                            const int nt_max = tinygemm_rows_tiles(M);
+                            for (int t = 0; t < tiles; t += nt_max) {
+                                const int nt = std::min(nt_max, tiles - t);
+                                const char * B = (const char *)src0->data + src0_offset + PACKED_INDEX((nb * 4 + t), 0, KB, TILE_SIZE);
+                                float * C = (float *)dst->data + dst_offset + nb * BLOCK_N + t * TILE_N;
+                                tinygemm_rows_k<type>(M, nt, KB, A, bs32.data(), B, C, ldc);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        if (done) {
+            return;
+        }
+    }
 
     if (M == 1) {
         // MB = 1 and handle 8 tiles in each block
