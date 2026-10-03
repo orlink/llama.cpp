@@ -1,3 +1,9 @@
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <cstdio>
+#include <cstring>
+#include "gguf.h"
 #include <atomic>
 #include <cmath>
 #include <vector>
@@ -2533,6 +2539,421 @@ static void amx_half_report(double err, double err_int8, double scale) {
 
 #endif // __AMX_BF16__ && __AVX512BF16__
 
+// Prototype: AMX int8 kernel with large scale groups from a second copy of the weights (inserted into
+// ggml-cpu/amx/mmq.cpp by apply_patch.py, after tools/llama_amx_half).
+//
+// ggml's int8 AMX kernel rescales after every 32 values (the Q4_0 / Q8_0 block). With one scale per G values
+// (G = 128 / 256 ...) for both weights and activations, G / 64 full-width int8 tile multiplies (TDPBSSD, 64 values
+// each) accumulate in an int32 tile before one rescale. The weights for it are a second copy made at load time, so
+// passes of 1-8 tokens keep reading the smaller original weights (VNNI kernels).
+//
+// GGML_AMX_I8G=G                  group size (0 / unset: off)
+// GGML_AMX_I8G_FILE=model.gguf    the copy's values: a GGUF whose matrix tensors are Q8_0 blocks sharing one scale per
+//                                 G values (tools/llama_quant_groups/requant_groups.py, also 4-bit values -8..7)
+// GGML_AMX_I8G_BITS4=a,b          tensors (name contains a or b) to store in fewer bits when their values allow:
+//                                 -8..7 as 4-bit nibbles (half the bytes), -16..15 / -32..31 as nibbles plus one / two
+//                                 planes of high bits (5/8, 6/8 of the bytes); unpacked to int8 in L1 before tile loads
+// GGML_AMX_I8G_AHEAD=L            unpack the low-bit weight tiles L 64-value steps ahead into a ring of L1 buffers
+//                                 (default 0). Measured 2026-10-03: 1 and 2 made no difference (within 1 ms); the
+//                                 store-to-tile-load wait is already hidden by out-of-order execution / the sibling thread
+// GGML_AMX_I8G_MIN_M=9            smallest pass (rows) sent here
+// GGML_AMX_I8G_CHECK=1            compare sampled outputs with an FP64 sum of the same int8 products (testing)
+// GGML_AMX_I8G_PREFETCH=D         software-prefetch each weight tile D 64-value steps ahead (default 0: off). Measured
+//                                 2026-10-03: 4, 8 and 16 (L2) were all 5-10% slower; the hardware prefetcher keeps up
+// GGML_AMX_I8G_PREFETCH_L2=1      prefetch into L2 (_MM_HINT_T1) instead of L1
+
+#if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
+// (<mutex>, <string>, <unordered_map>, <cstdio>, <cstring> and gguf.h are included at the top of the file by apply_patch.py)
+
+#define AMX_I8G_PACKED_INDEX(n, k, KB, tile_size) ((size_t)((n) * (KB) + (k)) * (tile_size))
+#define AMX_I8G_MEMORY_BARRIER() __asm__ __volatile__("" ::: "memory")
+
+struct amx_i8g_copy {
+    int N = 0, K = 0, G = 0;
+    int bits = 8;             // 8, 6, 5 or 4
+    std::vector<int8_t> q;    // int8: tiles [N / 16][K / 64] of 16 rows (4 values each) x 16 columns x 4 = 1 KB
+    std::vector<uint8_t> q4;  // 4 / 5-bit: the same tiles, 512 bytes each: byte i = u[i] & 15 | (u[i + 512] & 15) << 4,
+                              // u = t + 2^(bits - 1)
+    std::vector<uint64_t> q5; // 5 / 6-bit: per tile and high bit b (bits - 4 planes) 16 words: bit k of word w is
+                              // bit 4 + b of u[64 w + k], u = t + 2^(bits - 1)
+    std::vector<float> s;     // scales [N / 16][K / G][16]
+};
+
+static int amx_i8g_env_int(const char * name, int dflt) {
+    const char * s = getenv(name);
+    return s ? atoi(s) : dflt;
+}
+static int amx_i8g_group() { static const int v = amx_i8g_env_int("GGML_AMX_I8G", 0); return v; }
+static int amx_i8g_min_m() { static const int v = amx_i8g_env_int("GGML_AMX_I8G_MIN_M", 9); return v; }
+static bool amx_i8g_check() { static const bool v = getenv("GGML_AMX_I8G_CHECK") != nullptr; return v; }
+static int amx_i8g_prefetch() { static const int v = amx_i8g_env_int("GGML_AMX_I8G_PREFETCH", 0); return v; }
+static bool amx_i8g_prefetch_l2() { static const bool v = amx_i8g_env_int("GGML_AMX_I8G_PREFETCH_L2", 0) != 0; return v; }
+
+// prefetch one weight tile (column tile nt, step ks) of the copy
+static inline void amx_i8g_prefetch_tile(const amx_i8g_copy & cp, int nt, int ks, int KS) {
+    const char * p;
+    int lines;
+    if (cp.bits < 8) { p = (const char *)cp.q4.data() + AMX_I8G_PACKED_INDEX(nt, ks, KS, 512); lines = 8; }
+    else { p = (const char *)cp.q.data() + AMX_I8G_PACKED_INDEX(nt, ks, KS, 1024); lines = 16; }
+    if (amx_i8g_prefetch_l2()) { for (int j = 0; j < lines; ++j) _mm_prefetch(p + 64 * j, _MM_HINT_T1); }
+    else { for (int j = 0; j < lines; ++j) _mm_prefetch(p + 64 * j, _MM_HINT_T0); }
+}
+
+static std::mutex amx_i8g_mutex;
+static std::unordered_map<const void *, amx_i8g_copy *> amx_i8g_copies;
+
+static const amx_i8g_copy * amx_i8g_find(const void * packed) {
+    if (amx_i8g_group() <= 0) return nullptr;
+    std::lock_guard<std::mutex> lock(amx_i8g_mutex);
+    auto it = amx_i8g_copies.find(packed);
+    return it == amx_i8g_copies.end() ? nullptr : it->second;
+}
+
+// Called after a weight is repacked into the AMX buffer: builds the copy from GGML_AMX_I8G_FILE's tensor of the same
+// name (Q8_0 blocks, one shared scale per G values).
+static void amx_i8g_make_copy(const struct ggml_tensor * tensor) {
+    const int G = amx_i8g_group();
+    const char * path = getenv("GGML_AMX_I8G_FILE");
+    if (G <= 0 || G % 64 != 0 || path == nullptr) return;
+    const int K = tensor->ne[0], N = tensor->ne[1];
+    if (K % G != 0 || N % 32 != 0 || ggml_nrows(tensor) != N) return;
+
+    static std::mutex file_mutex;
+    static gguf_context * ctx = nullptr;
+    static FILE * fp = nullptr;
+    std::lock_guard<std::mutex> lock(file_mutex);
+    if (ctx == nullptr) {
+        gguf_init_params params = { /* .no_alloc = */ true, /* .ctx = */ nullptr };
+        ctx = gguf_init_from_file(path, params);
+        fp = fopen(path, "rb");
+        if (ctx == nullptr || fp == nullptr) {
+            fprintf(stderr, "amx_i8g: cannot read %s\n", path);
+            return;
+        }
+    }
+    const int64_t idx = gguf_find_tensor(ctx, tensor->name);
+    if (idx < 0 || gguf_get_tensor_type(ctx, idx) != GGML_TYPE_Q8_0) return;
+    const size_t nblocks = (size_t) N * K / 32;
+    std::vector<block_q8_0> src(nblocks);
+    if (gguf_get_tensor_size(ctx, idx) != nblocks * sizeof(block_q8_0)) return;
+    if (fseeko(fp, (off_t)(gguf_get_data_offset(ctx) + gguf_get_tensor_offset(ctx, idx)), SEEK_SET) != 0 ||
+        fread(src.data(), sizeof(block_q8_0), nblocks, fp) != nblocks) {
+        fprintf(stderr, "amx_i8g: read failed for %s\n", tensor->name);
+        return;
+    }
+
+    bool lowbit = false;
+    if (const char * b = getenv("GGML_AMX_I8G_BITS4")) {
+        std::string list = b;
+        size_t p = 0;
+        while (p <= list.size()) {
+            const size_t e = std::min(list.find(',', p), list.size());
+            const std::string part = list.substr(p, e - p);
+            if (!part.empty() && strstr(tensor->name, part.c_str())) lowbit = true;
+            p = e + 1;
+        }
+    }
+
+    // the copy holds one scale per group: only tensors whose blocks share it within each group (token_embd, for one,
+    // is kept per 32 by requant_groups.py); anything else would compute wrong results
+    for (size_t b = 0; b < nblocks; ++b) {
+        const size_t first = b - b % (size_t)(G / 32);
+        if (src[b].d != src[first].d) {
+            static int skipped = 0;
+            if (skipped++ < 3) fprintf(stderr, "amx_i8g: no copy of %s (scales not shared per %d values)\n", tensor->name, G);
+            return;
+        }
+    }
+    auto * cp = new amx_i8g_copy();
+    cp->N = N; cp->K = K; cp->G = G;
+    const int KS = K / 64, NG = K / G, KB = K / 32;
+    cp->s.resize((size_t) N / 16 * NG * 16);
+    std::vector<int8_t> tiles((size_t) N / 16 * KS * 1024);
+    for (int n = 0; n < N; ++n) {
+        const block_q8_0 * row = src.data() + (size_t) n * KB;
+        for (int g = 0; g < NG; ++g) {
+            cp->s[((size_t)(n / 16) * NG + g) * 16 + n % 16] = GGML_CPU_FP16_TO_FP32(row[g * (G / 32)].d);
+        }
+        for (int k = 0; k < K; ++k) {
+            const int8_t v = row[k / 32].qs[k % 32];
+            tiles[((size_t)(n / 16) * KS + k / 64) * 1024 + ((k % 64) / 4) * 64 + (n % 16) * 4 + k % 4] = v;
+        }
+    }
+    int bits = 8;
+    if (lowbit) {  // the fewest bits every value fits
+        int8_t lo = 0, hi = 0;
+        for (int8_t v : tiles) { lo = std::min(lo, v); hi = std::max(hi, v); }
+        bits = (lo >= -8 && hi <= 7) ? 4 : (lo >= -16 && hi <= 15) ? 5 : (lo >= -32 && hi <= 31) ? 6 : 8;
+    }
+    cp->bits = bits;
+    if (bits < 8) {
+        const int bias = 1 << (bits - 1), planes = bits - 4;
+        const size_t ntiles = tiles.size() / 1024;
+        cp->q4.resize(ntiles * 512);
+        if (planes > 0) cp->q5.assign(ntiles * 16 * planes, 0);
+        for (size_t t = 0; t < ntiles; ++t) {
+            for (int i = 0; i < 1024; ++i) {
+                const int u = tiles[t * 1024 + i] + bias;
+                if (i < 512) cp->q4[t * 512 + i] = (uint8_t)(u & 15);
+                else cp->q4[t * 512 + i - 512] |= (uint8_t)((u & 15) << 4);
+                for (int b = 0; b < planes; ++b) {
+                    if ((u >> (4 + b)) & 1) cp->q5[(t * planes + b) * 16 + i / 64] |= 1ull << (i % 64);
+                }
+            }
+        }
+    } else {
+        cp->q = std::move(tiles);
+    }
+    std::lock_guard<std::mutex> lock2(amx_i8g_mutex);
+    amx_i8g_copies[tensor->data] = cp;
+    static int reported = 0;
+    if (reported++ < 3) {
+        fprintf(stderr, "amx_i8g: copy of %s (%d x %d, groups of %d, %d-bit)\n", tensor->name, N, K, G, cp->bits);
+    }
+}
+
+// Unpack one 4 / 5-bit weight tile (column tile nt, step ks) to int8 at dst (1 KB, in L1)
+static inline void amx_i8g_unpack(const amx_i8g_copy & cp, int nt, int ks, int KS, int8_t * RESTRICT dst) {
+    const __m512i lowMask = _mm512_set1_epi8(0xF);
+    const size_t t = (size_t) nt * KS + ks;
+    const uint8_t * pk = cp.q4.data() + t * 512;
+    if (cp.bits == 4) {
+        const __m512i off = _mm512_set1_epi8(8);
+        for (int j = 0; j < 8; ++j) {
+            const __m512i v = _mm512_loadu_si512((const __m512i *)(pk + 64 * j));
+            _mm512_store_si512((__m512i *)(dst + 64 * j), _mm512_sub_epi8(_mm512_and_si512(v, lowMask), off));
+            _mm512_store_si512((__m512i *)(dst + 512 + 64 * j), _mm512_sub_epi8(_mm512_and_si512(_mm512_srli_epi16(v, 4), lowMask), off));
+        }
+    } else {
+        const int planes = cp.bits - 4;
+        const __m512i off = _mm512_set1_epi8((char)(1 << (cp.bits - 1)));
+        const __m512i b16 = _mm512_set1_epi8(16), b32 = _mm512_set1_epi8(32);
+        const uint64_t * hb = cp.q5.data() + t * 16 * planes;
+        for (int j = 0; j < 8; ++j) {
+            const __m512i v = _mm512_loadu_si512((const __m512i *)(pk + 64 * j));
+            __m512i lo = _mm512_and_si512(v, lowMask);
+            __m512i hi = _mm512_and_si512(_mm512_srli_epi16(v, 4), lowMask);
+            lo = _mm512_mask_add_epi8(lo, _cvtu64_mask64(hb[j]), lo, b16);       // bit 4
+            hi = _mm512_mask_add_epi8(hi, _cvtu64_mask64(hb[j + 8]), hi, b16);
+            if (planes == 2) {                                                  // bit 5
+                lo = _mm512_mask_add_epi8(lo, _cvtu64_mask64(hb[16 + j]), lo, b32);
+                hi = _mm512_mask_add_epi8(hi, _cvtu64_mask64(hb[16 + j + 8]), hi, b32);
+            }
+            _mm512_store_si512((__m512i *)(dst + 64 * j), _mm512_sub_epi8(lo, off));
+            _mm512_store_si512((__m512i *)(dst + 512 + 64 * j), _mm512_sub_epi8(hi, off));
+        }
+    }
+}
+
+static int amx_i8g_ahead() { static const int v = std::max(0, std::min(2, amx_i8g_env_int("GGML_AMX_I8G_AHEAD", 0))); return v; }
+
+// One activation row to int8, one scale per G values (FP16-rounded max / 127, as Q8_0), in tile order:
+// value k goes to y[(k / 64) * 1024 + k % 64] (y = the row's place in its 16-row tile block). x == nullptr: zeros.
+static void amx_i8g_quantize_row(const float * x, int8_t * y, float * scales, int K, int G) {
+    for (int g0 = 0; g0 < K; g0 += G) {
+        float d = 0.0f;
+        if (x != nullptr) {
+            __m512 vmax = _mm512_setzero_ps();
+            for (int k = g0; k < g0 + G; k += 16) vmax = _mm512_max_ps(vmax, _mm512_abs_ps(_mm512_loadu_ps(x + k)));
+            d = GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(_mm512_reduce_max_ps(vmax) / 127.0f));
+        }
+        scales[g0 / G] = d;
+        const __m512 id = _mm512_set1_ps(d ? 1.0f / d : 0.0f);
+        for (int k = g0; k < g0 + G; k += 16) {
+            __m128i q = _mm_setzero_si128();
+            if (x != nullptr) {
+                const __m512i v = _mm512_cvtps_epi32(_mm512_roundscale_ps(_mm512_mul_ps(_mm512_loadu_ps(x + k), id), _MM_FROUND_TO_NEAREST_INT));
+                q = _mm512_cvtsepi32_epi8(v);
+            }
+            _mm_storeu_si128((__m128i *)(y + (k / 64) * 1024 + k % 64), q);
+        }
+    }
+}
+
+// C[M x 32 columns] for 32-column block nb32 of the copy. A: tiles [Mpad / 16][K / 64][16 x 64] int8; as: scales
+// [Mpad][K / G]. Per 32-row block: 2 x 2 output tiles, G / 64 multiplies per group, one rescale per group.
+static void amx_i8g_slice(const amx_i8g_copy & cp, int nb32, int M, const int8_t * RESTRICT A, const float * RESTRICT as,
+                          float * RESTRICT C, int ldc) {
+    const int K = cp.K, G = cp.G, KS = K / 64, NG = K / G, GS = G / 64;
+    const int nt0 = nb32 * 2, nt1 = nt0 + 1;
+    const int PD = amx_i8g_prefetch();
+    alignas(64) float acc[32 * 32];
+    alignas(64) int32_t Ci[32 * 32];
+    alignas(64) int8_t Bl[3 * 2 * 1024];  // ring of 3 steps x 2 tiles (GGML_AMX_I8G_AHEAD)
+    const int AH = cp.bits < 8 ? amx_i8g_ahead() : 0;
+    for (int m0 = 0; m0 < M; m0 += 32) {
+        const int8_t * A0 = A + (size_t)(m0 / 16) * KS * 1024;
+        const int8_t * A1 = A0 + (size_t)KS * 1024;
+        memset(acc, 0, sizeof(acc));
+        if (cp.bits < 8) {
+            for (int k = 0; k < AH && k < KS; ++k) {
+                amx_i8g_unpack(cp, nt0, k, KS, Bl + (k % 3) * 2048);
+                amx_i8g_unpack(cp, nt1, k, KS, Bl + (k % 3) * 2048 + 1024);
+            }
+        }
+        for (int g = 0; g < NG; ++g) {
+            _tile_zero(4); _tile_zero(5); _tile_zero(6); _tile_zero(7);
+            for (int s = 0; s < GS; ++s) {
+                const int ks = g * GS + s;
+                if (PD > 0 && ks + PD < KS) {
+                    amx_i8g_prefetch_tile(cp, nt0, ks + PD, KS);
+                    amx_i8g_prefetch_tile(cp, nt1, ks + PD, KS);
+                }
+                const int8_t * B0;
+                const int8_t * B1;
+                if (cp.bits < 8) {
+                    AMX_I8G_MEMORY_BARRIER();
+                    const int ku = ks + AH;
+                    if (ku < KS) {
+                        amx_i8g_unpack(cp, nt0, ku, KS, Bl + (ku % 3) * 2048);
+                        amx_i8g_unpack(cp, nt1, ku, KS, Bl + (ku % 3) * 2048 + 1024);
+                    }
+                    AMX_I8G_MEMORY_BARRIER();
+                    B0 = Bl + (ks % 3) * 2048; B1 = B0 + 1024;
+                } else {
+                    B0 = cp.q.data() + AMX_I8G_PACKED_INDEX(nt0, ks, KS, 1024);
+                    B1 = cp.q.data() + AMX_I8G_PACKED_INDEX(nt1, ks, KS, 1024);
+                }
+                _tile_loadd(0, B0, 64);
+                _tile_loadd(2, A0 + (size_t)ks * 1024, 64);
+                _tile_dpbssd(4, 2, 0);
+                _tile_loadd(1, B1, 64);
+                _tile_dpbssd(6, 2, 1);
+                _tile_loadd(3, A1 + (size_t)ks * 1024, 64);
+                _tile_dpbssd(5, 3, 0);
+                _tile_dpbssd(7, 3, 1);
+            }
+            _tile_stored(4, Ci, 128);
+            _tile_stored(6, Ci + 16, 128);
+            _tile_stored(5, Ci + 16 * 32, 128);
+            _tile_stored(7, Ci + 16 * 32 + 16, 128);
+            AMX_I8G_MEMORY_BARRIER();
+            const __m512 ws0 = _mm512_loadu_ps(cp.s.data() + ((size_t)nt0 * NG + g) * 16);
+            const __m512 ws1 = _mm512_loadu_ps(cp.s.data() + ((size_t)nt1 * NG + g) * 16);
+            const int rows = std::min(32, M - m0);
+            for (int r = 0; r < rows; ++r) {
+                const __m512 sa = _mm512_set1_ps(as[(size_t)(m0 + r) * NG + g]);
+                _mm512_store_ps(acc + r * 32, _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_load_si512(Ci + r * 32)), _mm512_mul_ps(ws0, sa), _mm512_load_ps(acc + r * 32)));
+                _mm512_store_ps(acc + r * 32 + 16, _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_load_si512(Ci + r * 32 + 16)), _mm512_mul_ps(ws1, sa), _mm512_load_ps(acc + r * 32 + 16)));
+            }
+        }
+        const int rows = std::min(32, M - m0);
+        for (int r = 0; r < rows; ++r) {
+            _mm512_storeu_ps(C + (size_t)(m0 + r) * ldc + nb32 * 32, _mm512_load_ps(acc + r * 32));
+            _mm512_storeu_ps(C + (size_t)(m0 + r) * ldc + nb32 * 32 + 16, _mm512_load_ps(acc + r * 32 + 16));
+        }
+    }
+}
+
+// Up to 16 rows: one activation tile against nt (4, or 2 at the edge of N) weight tiles, 64 columns per call, so no
+// tile multiply works on padding rows (the 2 x 2 layout above wastes half of them below 17 rows). Tiles: 3 A,
+// 0-2 B (rotating), 4-7 C.
+static void amx_i8g_slice16(const amx_i8g_copy & cp, int nt0, int nt, int M, const int8_t * RESTRICT A,
+                            const float * RESTRICT as, float * RESTRICT C, int ldc) {
+    const int K = cp.K, G = cp.G, KS = K / 64, NG = K / G, GS = G / 64;
+    const int PD = amx_i8g_prefetch();
+    alignas(64) float acc[16 * 64];
+    alignas(64) int32_t Ci[16 * 64];
+    alignas(64) int8_t Bl[3 * 4 * 1024];  // ring of 3 steps x up to 4 tiles (GGML_AMX_I8G_AHEAD)
+    const int AH = cp.bits < 8 ? amx_i8g_ahead() : 0;
+    if (cp.bits < 8) {
+        for (int k = 0; k < AH && k < KS; ++k) {
+            for (int t = 0; t < nt; ++t) amx_i8g_unpack(cp, nt0 + t, k, KS, Bl + (k % 3) * 4096 + t * 1024);
+        }
+    }
+    memset(acc, 0, sizeof(acc));
+    for (int g = 0; g < NG; ++g) {
+        _tile_zero(4); _tile_zero(5); _tile_zero(6); _tile_zero(7);
+        for (int s = 0; s < GS; ++s) {
+            const int ks = g * GS + s;
+            if (PD > 0 && ks + PD < KS) {
+                for (int t = 0; t < nt; ++t) amx_i8g_prefetch_tile(cp, nt0 + t, ks + PD, KS);
+            }
+            const int8_t * Bt[4];
+            if (cp.bits < 8) {
+                AMX_I8G_MEMORY_BARRIER();
+                const int ku = ks + AH;  // the step unpacked now; step ks was unpacked AH steps ago
+                if (ku < KS) {
+                    for (int t = 0; t < nt; ++t) amx_i8g_unpack(cp, nt0 + t, ku, KS, Bl + (ku % 3) * 4096 + t * 1024);
+                }
+                for (int t = 0; t < nt; ++t) Bt[t] = Bl + (ks % 3) * 4096 + t * 1024;
+                AMX_I8G_MEMORY_BARRIER();
+            } else {
+                for (int t = 0; t < nt; ++t) Bt[t] = cp.q.data() + AMX_I8G_PACKED_INDEX(nt0 + t, ks, KS, 1024);
+            }
+            _tile_loadd(3, A + (size_t)ks * 1024, 64);
+            _tile_loadd(0, Bt[0], 64); _tile_dpbssd(4, 3, 0);
+            _tile_loadd(1, Bt[1], 64); _tile_dpbssd(5, 3, 1);
+            if (nt == 4) {
+                _tile_loadd(2, Bt[2], 64); _tile_dpbssd(6, 3, 2);
+                _tile_loadd(0, Bt[3], 64); _tile_dpbssd(7, 3, 0);
+            }
+        }
+        _tile_stored(4, Ci, 256);
+        _tile_stored(5, Ci + 16, 256);
+        if (nt == 4) {
+            _tile_stored(6, Ci + 32, 256);
+            _tile_stored(7, Ci + 48, 256);
+        }
+        AMX_I8G_MEMORY_BARRIER();
+        for (int r = 0; r < M; ++r) {
+            const __m512 sa = _mm512_set1_ps(as[(size_t)r * NG + g]);
+            for (int t = 0; t < nt; ++t) {
+                const __m512 ws = _mm512_loadu_ps(cp.s.data() + ((size_t)(nt0 + t) * NG + g) * 16);
+                _mm512_store_ps(acc + r * 64 + t * 16, _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_load_si512(Ci + r * 64 + t * 16)),
+                                                                       _mm512_mul_ps(ws, sa), _mm512_load_ps(acc + r * 64 + t * 16)));
+            }
+        }
+    }
+    for (int r = 0; r < M; ++r) {
+        for (int t = 0; t < nt; ++t) {
+            _mm512_storeu_ps(C + (size_t)r * ldc + (nt0 + t) * 16, _mm512_load_ps(acc + r * 64 + t * 16));
+        }
+    }
+}
+
+// The same output from the copy's integers in FP64 (GGML_AMX_I8G_CHECK)
+static double amx_i8g_ref(const amx_i8g_copy & cp, int n, const int8_t * A, const float * as, int m, double * abs_sum) {
+    const int K = cp.K, G = cp.G, KS = K / 64, NG = K / G;
+    double sum = 0;
+    for (int g = 0; g < NG; ++g) {
+        int64_t isum = 0;
+        for (int k = g * G; k < (g + 1) * G; ++k) {
+            const size_t ti = ((size_t)(n / 16) * KS + k / 64);
+            const int within = ((k % 64) / 4) * 64 + (n % 16) * 4 + k % 4;
+            int w;
+            if (cp.bits < 8) {
+                const uint8_t b = cp.q4[ti * 512 + within % 512];
+                int u = within < 512 ? (b & 0xF) : (b >> 4);
+                for (int b = 0; b < cp.bits - 4; ++b) {
+                    u |= (int)((cp.q5[(ti * (cp.bits - 4) + b) * 16 + within / 64] >> (within % 64)) & 1) << (4 + b);
+                }
+                w = u - (1 << (cp.bits - 1));
+            } else {
+                w = cp.q[ti * 1024 + within];
+            }
+            const int a = A[((size_t)(m / 16) * KS + k / 64) * 1024 + (m % 16) * 64 + k % 64];
+            isum += (int64_t) w * a;
+        }
+        const double term = (double) isum * as[(size_t)m * NG + g] * cp.s[((size_t)(n / 16) * NG + g) * 16 + n % 16];
+        sum += term;
+        *abs_sum += std::fabs(term);
+    }
+    return sum;
+}
+
+// difference relative to the sum of the groups' magnitudes (a relative difference to the result itself is unbounded
+// when the groups cancel out)
+static void amx_i8g_report(double rel) {
+    static std::atomic<long> n{0};
+    static std::atomic<double> mx{0}, sum{0};
+    double cur = mx.load(); while (rel > cur && !mx.compare_exchange_weak(cur, rel)) {}
+    cur = sum.load(); while (!sum.compare_exchange_weak(cur, cur + rel)) {}
+    const long c = ++n;
+    if ((c & (c - 1)) == 0 && c >= 256) fprintf(stderr, "amx_i8g checked %ld outputs, diff relative to the terms: mean %.3g, max %.3g\n", c, sum.load() / c, mx.load());
+}
+#endif
+
 #define LAUNCH_TINYGEMM_KERNEL_VNNI(NB_SIZE)                                                   \
     tinygemm_kernel_vnni<vec_dot_type, type, float, 1, NB_SIZE, blck_size>::apply(             \
         KB, wdata_batch,                                                                       \
@@ -2848,6 +3269,9 @@ void ggml_backend_amx_convert_weight(struct ggml_tensor * tensor, const void * d
     GGML_DISPATCH_QTYPES(TYPE, [&] {
         convert_B_packed_format<type, blck_size>((void *)((char *)tensor->data + offset), (const type *)data, N, K);
     });
+#if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
+    amx_i8g_make_copy(tensor);
+#endif
 }
 
 // ne2 is passed explicitly to help compiler optimize repeated calls
@@ -2880,6 +3304,8 @@ size_t ggml_backend_amx_desired_wsize(const struct ggml_tensor * dst) {
     if (TYPE == GGML_TYPE_Q4_0 || TYPE == GGML_TYPE_Q8_0) {
         const size_t Mpad = (M + 31) / 32 * 32;  // FP16 / BF16 activations and the rows' scale factors
         desired_wsize = std::max(desired_wsize, (size_t) n_batch * Mpad * (K * sizeof(uint16_t) + sizeof(float)));
+        // the grouped int8 copy's activations (int8, rows padded to 32) and scales (at most K / 64 per row)
+        desired_wsize = std::max(desired_wsize, (size_t) n_batch * Mpad * (K + (K / 64) * sizeof(float)));
     }
 
     return desired_wsize;
@@ -2957,6 +3383,67 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
 
     // pointer to work space, used convert A from float to quantized type
     void * wdata = params->wdata;
+
+#if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
+    // passes of GGML_AMX_I8G_MIN_M or more rows with a grouped int8 copy of the weights (amx_i8g.inc)
+    if (M >= amx_i8g_min_m()) {
+        if (const amx_i8g_copy * cp = amx_i8g_find(src0->data); cp != nullptr && cp->K == K && cp->N == N) {
+            const int G = cp->G, NG = K / G, KS = K / 64;
+            const int Mpad = div_up(M, 32) * 32;
+            int8_t * Aq = (int8_t *) wdata;                                // [n_batch][Mpad * K], tile order
+            float * as = (float *)(Aq + (size_t) n_batch * Mpad * K);       // [n_batch][Mpad][NG]
+            parallel_for_ggml(params, n_batch * Mpad, [&](int begin, int end) {
+                for (int idx = begin; idx < end; ++idx) {
+                    const int batch_idx = idx / Mpad;
+                    const int m = idx % Mpad;
+                    int8_t * y = Aq + (size_t) batch_idx * Mpad * K + (size_t) (m / 16) * KS * 1024 + (m % 16) * 64;
+                    const float * x = m < M ? (const float *)((const char *) src1->data + ggml_batch_offset(src1, batch_idx, ne2)) + (size_t) m * K : nullptr;
+                    amx_i8g_quantize_row(x, y, as + (size_t) idx * NG, K, G);
+                }
+            });
+            ggml_barrier(params->threadpool);
+            const bool rows16 = M <= 16;              // one activation tile, 64 columns per task
+            const int NB = rows16 ? div_up(N, 64) : N / 32;
+            parallel_for_ggml(params, n_batch * NB, [&](int begin, int end) {
+                if (begin >= end) {
+                    return;
+                }
+                amx_half_tile_config();
+                for (int i = begin; i < end; ++i) {
+                    const int batch_idx = i / NB;
+                    const int nb = i % NB;
+                    const int64_t dst_offset = ggml_batch_offset(dst, batch_idx, ne2);
+                    const int8_t * A = Aq + (size_t) batch_idx * Mpad * K;
+                    const float * asb = as + (size_t) batch_idx * Mpad * NG;
+                    float * C = (float *) dst->data + dst_offset;
+                    int ncols;
+                    if (rows16) {
+                        const int nt = std::min(4, N / 16 - nb * 4);
+                        amx_i8g_slice16(*cp, nb * 4, nt, M, A, asb, C, ldc);
+                        ncols = nt * 16;
+                    } else {
+                        amx_i8g_slice(*cp, nb, M, A, asb, C, ldc);
+                        ncols = 32;
+                    }
+                    if (amx_i8g_check()) {
+                        for (int s = 0; s < 2; ++s) {
+                            const int m = (nb * 7 + s * 13) % M;
+                            const int n = nb * (rows16 ? 64 : 32) + (nb * 5 + s * 17) % ncols;
+                            double abs_sum = 0;
+                            const double ref = amx_i8g_ref(*cp, n, A, asb, m, &abs_sum);
+                            const double got = C[(size_t) m * ldc + n];
+                            if (abs_sum > 0) {
+                                amx_i8g_report(std::fabs(got - ref) / abs_sum);
+                            }
+                        }
+                    }
+                }
+                amx_int8_tile_config_restore();
+            });
+            return;
+        }
+    }
+#endif
 
 #if defined(GGML_AMX_HALF_KERNELS)
     // Q4_0 / Q8_0 with GGML_AMX_HALF_MIN_M or more rows: FP16 / BF16 tiles (amx_half.inc) instead of the int8 kernel
