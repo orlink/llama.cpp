@@ -2158,6 +2158,381 @@ static int vnni_rows_max_m() {
     return v;
 }
 
+// AMX-FP16 / AMX-BF16 kernels for Q4_0 / Q8_0 weights and larger batches (inserted into ggml-cpu/amx/mmq.cpp by
+// apply_patch.py).
+//
+// ggml's AMX int8 kernel multiplies one 32-value block at a time (TILE_K = 32, the quantization block), stores the
+// int32 tile and rescales it with AVX512 by both blocks' scales before the next block: the AVX512 work, not the tile
+// multiply, sets its speed (about 1 TOPS on 4 Granite Rapids cores). Here each 32-column slice of the weights is
+// dequantized once per call into 16-bit float tiles (scale applied, kept in L2 for all row blocks), the activations
+// are converted once, and the tile multiply accumulates in FP32 tiles over the whole K: no per-block store.
+//
+// FP16 (AMX-FP16 + AVX512-FP16, Granite Rapids): int8 -> FP16 and the scale in about 4 instructions per 32 weights;
+// activation rows are scaled by a power of two into FP16 range (exact) and the outputs scaled back.
+// BF16 (AMX-BF16 + AVX512-BF16, Sapphire Rapids and later): the fallback, about 10 instructions per 32 weights.
+// Numerics: activations in FP16 / BF16 instead of Q8_0, weights q * d rounded to FP16 / BF16; FP32 accumulation.
+
+#if defined(__AMX_BF16__) && defined(__AVX512BF16__)
+#define GGML_AMX_HALF_KERNELS 1
+// ggml's PACKED_INDEX does not parenthesize its arguments (PACKED_INDEX(h + 1, ...) silently means h + KB + ...)
+#define AMX_HALF_PACKED_INDEX(n, k, KB, tile_size) ((size_t)((n) * (KB) + (k)) * (tile_size))
+// GCC's _tile_loadd / _tile_stored are inline asm without a memory clobber: the compiler does not know they read or
+// write memory, so it may sink or drop the AVX512 stores of a buffer a tile then loads (seen with a stack buffer:
+// garbage results), or read a tile's stored output too early. A compiler barrier between the two fixes the order.
+#define AMX_HALF_MEMORY_BARRIER() __asm__ __volatile__("" ::: "memory")
+#if defined(__AMX_FP16__) && defined(__AVX512FP16__)
+#define GGML_AMX_HALF_FP16 1
+#endif
+
+// GGML_AMX_HALF_MIN_M: smallest M sent here (default 9, above the multi-row VNNI kernels; 0 disables)
+static int amx_half_min_m() {
+    static const int v = [] {
+        const char * s = getenv("GGML_AMX_HALF_MIN_M");
+        return s ? atoi(s) : 9;
+    }();
+    return v;
+}
+
+// GGML_AMX_HALF_BF16=1 uses BF16 even where FP16 is available (for comparisons)
+static bool amx_half_use_fp16() {
+#if defined(GGML_AMX_HALF_FP16)
+    static const bool v = getenv("GGML_AMX_HALF_BF16") == nullptr;
+    return v;
+#else
+    return false;
+#endif
+}
+
+// tiles 0-1: B (16 rows of 16 columns x 2 values), 2-3: A (16 rows x 32 values), 4-7: C (16 x 16 FP32)
+static void amx_half_tile_config(void) {
+    alignas(64) tile_config_t tc = {};
+    tc.palette_id = 1;
+    for (int t = 0; t < 8; ++t) {
+        tc.rows[t] = 16;
+        tc.colsb[t] = 64;
+    }
+    _tile_loadconfig(&tc);
+}
+
+// ggml's int8 configuration (ggml_tile_config_init loads it only once per thread)
+static void amx_int8_tile_config_restore(void) {
+    alignas(64) tile_config_t tc = {};
+    tc.palette_id = 1;
+    tc.rows[0] = 8;   tc.colsb[0] = 64;
+    tc.rows[1] = 8;   tc.colsb[1] = 64;
+    tc.rows[2] = 16;  tc.colsb[2] = 32;
+    tc.rows[3] = 16;  tc.colsb[3] = 32;
+    for (int t = 4; t < 8; ++t) {
+        tc.rows[t] = 16;
+        tc.colsb[t] = 64;
+    }
+    _tile_loadconfig(&tc);
+}
+
+// byte order within a 64-byte int8 VNNI row: column n, values 4n..4n+3. This picks values 0,1 of every column into
+// bytes 0-31 and values 2,3 into bytes 32-63: the two 16-bit tile rows (16 columns x 2 values) made from one int8 row.
+static inline __m512i amx_half_pick() {
+    return _mm512_set_epi8(
+        63, 62, 59, 58, 55, 54, 51, 50, 47, 46, 43, 42, 39, 38, 35, 34,
+        31, 30, 27, 26, 23, 22, 19, 18, 15, 14, 11, 10,  7,  6,  3,  2,
+        61, 60, 57, 56, 53, 52, 49, 48, 45, 44, 41, 40, 37, 36, 33, 32,
+        29, 28, 25, 24, 21, 20, 17, 16, 13, 12,  9,  8,  5,  4,  1,  0);
+}
+
+// One packed 16-column x 32-value block: int8 rows q[8] (VNNI layout) and the columns' FP16 scales d[16]
+template <typename TB>
+static inline void amx_half_load_block(const char * RESTRICT b_ptr, __m512i (&q)[8], const ggml_half *& d) {
+    if constexpr (std::is_same<TB, block_q4_0>::value) {
+        const __m512i lowMask = _mm512_set1_epi8(0xF);
+        const __m512i off = _mm512_set1_epi8(8);
+        for (int k = 0; k < 8; k += 2) {
+            const __m512i bytes = _mm512_loadu_si512((const __m512i *)(b_ptr + k * 32));
+            q[k + 0] = _mm512_sub_epi8(_mm512_and_si512(bytes, lowMask), off);
+            q[k + 1] = _mm512_sub_epi8(_mm512_and_si512(_mm512_srli_epi16(bytes, 4), lowMask), off);
+        }
+        d = (const ggml_half *)(b_ptr + TILE_N * TILE_K / 2);
+    } else {
+        for (int k = 0; k < 8; ++k) {
+            q[k] = _mm512_loadu_si512((const __m512i *)(b_ptr + k * 64));
+        }
+        d = (const ggml_half *)(b_ptr + TILE_N * TILE_K);
+    }
+}
+
+// ... to a BF16 tile (16 rows x 64 bytes)
+template <typename TB>
+static inline void amx_half_dequant_bf16(const char * RESTRICT b_ptr, uint16_t * RESTRICT out) {
+    __m512i q[8];
+    const ggml_half * dh;
+    amx_half_load_block<TB>(b_ptr, q, dh);
+    const __m512 d = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) dh));
+    const __m512i pick = amx_half_pick();
+    const __m512 d_lo = _mm512_permutexvar_ps(_mm512_set_epi32(7, 7, 6, 6, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1, 0, 0), d);
+    const __m512 d_hi = _mm512_permutexvar_ps(_mm512_set_epi32(15, 15, 14, 14, 13, 13, 12, 12, 11, 11, 10, 10, 9, 9, 8, 8), d);
+    for (int r = 0; r < 8; ++r) {
+        const __m512i p = _mm512_permutexvar_epi8(pick, q[r]);
+        for (int h = 0; h < 2; ++h) {
+            const __m512 f0 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(p, 2 * h))), d_lo);
+            const __m512 f1 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(p, 2 * h + 1))), d_hi);
+            _mm512_storeu_si512((__m512i *)(out + (2 * r + h) * 32), (__m512i)_mm512_cvtne2ps_pbh(f1, f0));
+        }
+    }
+}
+
+#if defined(GGML_AMX_HALF_FP16)
+// ... to an FP16 tile: int8 -> int16 -> FP16, times the column's scale, both in FP16
+template <typename TB>
+static inline void amx_half_dequant_fp16(const char * RESTRICT b_ptr, uint16_t * RESTRICT out) {
+    __m512i q[8];
+    const ggml_half * dh;
+    amx_half_load_block<TB>(b_ptr, q, dh);
+    const __m512i dup = _mm512_set_epi16(15, 15, 14, 14, 13, 13, 12, 12, 11, 11, 10, 10, 9, 9, 8, 8,
+                                         7, 7, 6, 6, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1, 0, 0);
+    const __m512h d = _mm512_castsi512_ph(_mm512_permutexvar_epi16(dup, _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) dh))));
+    const __m512i pick = amx_half_pick();
+    for (int r = 0; r < 8; ++r) {
+        const __m512i p = _mm512_permutexvar_epi8(pick, q[r]);
+        const __m512h h0 = _mm512_mul_ph(_mm512_cvtepi16_ph(_mm512_cvtepi8_epi16(_mm512_castsi512_si256(p))), d);
+        const __m512h h1 = _mm512_mul_ph(_mm512_cvtepi16_ph(_mm512_cvtepi8_epi16(_mm512_extracti64x4_epi64(p, 1))), d);
+        _mm512_storeu_si512((__m512i *)(out + (2 * r + 0) * 32), _mm512_castph_si512(h0));
+        _mm512_storeu_si512((__m512i *)(out + (2 * r + 1) * 32), _mm512_castph_si512(h1));
+    }
+}
+#endif
+
+template <typename TB>
+static inline void amx_half_dequant(bool fp16, const char * RESTRICT b_ptr, uint16_t * RESTRICT out) {
+#if defined(GGML_AMX_HALF_FP16)
+    if (fp16) {
+        amx_half_dequant_fp16<TB>(b_ptr, out);
+        return;
+    }
+#endif
+    GGML_UNUSED(fp16);
+    amx_half_dequant_bf16<TB>(b_ptr, out);
+}
+
+// One float row to 16-bit floats, written in tile order: value k of the row goes to y[(k / 32) * 512 + k % 32]
+// (y points at the row's place in its 16-row tile; one tile = 16 rows x 32 values, KB tiles per 16-row block, so
+// every tile load reads 1 KB in a row). x == nullptr writes a zero row. K is a multiple of 32.
+// FP16: scaled by a power of two so the largest value is about 2^14 (FP16 tops out at 65504; Gemma's activations can
+// exceed it), *inv = the factor that undoes it. BF16: unscaled, *inv = 1.
+static void amx_half_convert_A(bool fp16, const float * RESTRICT x, uint16_t * RESTRICT y, int K, float * inv) {
+    *inv = 1.0f;
+    if (x == nullptr) {
+        for (int k = 0; k < K; k += 32) {
+            _mm512_storeu_si512((__m512i *)(y + (k / 32) * 512), _mm512_setzero_si512());
+        }
+        return;
+    }
+#if defined(GGML_AMX_HALF_FP16)
+    if (fp16) {
+        __m512 vmax = _mm512_setzero_ps();
+        for (int k = 0; k < K; k += 16) {
+            vmax = _mm512_max_ps(vmax, _mm512_abs_ps(_mm512_loadu_ps(x + k)));
+        }
+        const float amax = _mm512_reduce_max_ps(vmax);
+        int e = 0;
+        if (amax > 0 && std::isfinite(amax)) {
+            std::frexp(amax, &e);  // amax = f * 2^e, 0.5 <= f < 1
+        }
+        const __m512 vs = _mm512_set1_ps(std::ldexp(1.0f, 14 - e));  // amax * s < 2^14
+        *inv = std::ldexp(1.0f, e - 14);
+        for (int k = 0; k < K; k += 32) {
+            const __m256i lo = _mm512_cvtps_ph(_mm512_mul_ps(_mm512_loadu_ps(x + k), vs), _MM_FROUND_TO_NEAREST_INT);
+            const __m256i hi = _mm512_cvtps_ph(_mm512_mul_ps(_mm512_loadu_ps(x + k + 16), vs), _MM_FROUND_TO_NEAREST_INT);
+            _mm512_storeu_si512((__m512i *)(y + (k / 32) * 512), _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1));
+        }
+        return;
+    }
+#endif
+    GGML_UNUSED(fp16);
+    for (int k = 0; k < K; k += 32) {
+        const __m512bh v = _mm512_cvtne2ps_pbh(_mm512_loadu_ps(x + k + 16), _mm512_loadu_ps(x + k));
+        _mm512_storeu_si512((__m512i *)(y + (k / 32) * 512), (__m512i)v);
+    }
+}
+
+// GGML_AMX_HALF_BUFFER_M: from this M on a slice's weights are converted once into a buffer and reused by every row
+// block; otherwise (the default, 0) each 32-value weight block is converted right before its tile multiplies (it
+// stays in L1), once per 32-row block. Converting again per row block was faster at every size measured (up to 500
+// rows): a converted tile written by AVX512 and loaded by AMX from L1 costs ~12 ns more than one already in a tile
+// register, and from a buffer in L2 more still.
+static int amx_half_buffer_m() {
+    static const int v = [] {
+        const char * s = getenv("GGML_AMX_HALF_BUFFER_M");
+        return s ? atoi(s) : 0;
+    }();
+    return v;
+}
+
+#if defined(GGML_AMX_HALF_FP16)
+#define AMX_HALF_DP(c, a, b) do { if (fp16) { _tile_dpfp16ps(c, a, b); } else { _tile_dpbf16ps(c, a, b); } } while (0)
+#else
+#define AMX_HALF_DP(c, a, b) _tile_dpbf16ps(c, a, b)
+#endif
+
+// Store four 16 x 16 FP32 tiles (4-7) as rows x (16 * nt) values, undoing each row's scaling.
+// layout 0: one 16-row block, tiles 4-7 = columns 0-15, 16-31, 32-47, 48-63;
+// layout 1: two 16-row blocks x 32 columns, tiles 4/6 = rows 0-15, 5/7 = rows 16-31, 4/5 = columns 0-15, 6/7 = 16-31.
+static inline void amx_half_store_C(int layout, int nt, int rows, const float * RESTRICT inv, float * RESTRICT C, int ldc) {
+    alignas(64) float Ct[32 * 64];
+    if (layout == 0) {
+        _tile_stored(4, Ct, 256); _tile_stored(5, Ct + 16, 256);
+        if (nt == 4) { _tile_stored(6, Ct + 32, 256); _tile_stored(7, Ct + 48, 256); }
+    } else {
+        _tile_stored(4, Ct, 256); _tile_stored(6, Ct + 16, 256);
+        _tile_stored(5, Ct + 16 * 64, 256); _tile_stored(7, Ct + 16 * 64 + 16, 256);
+    }
+    AMX_HALF_MEMORY_BARRIER();
+    for (int r = 0; r < rows; ++r) {
+        const __m512 s = _mm512_set1_ps(inv[r]);
+        for (int t = 0; t < nt; ++t) {
+            _mm512_storeu_ps(C + (size_t)r * ldc + t * 16, _mm512_mul_ps(_mm512_load_ps(Ct + r * 64 + t * 16), s));
+        }
+    }
+}
+
+// C[M x ncols] for one slice of ncols = 16 * nt columns (nt = 4, or 2 at the edge of N). A: tiles in 16-row blocks
+// ([Mpad / 16][KB][16 x 32 values], zero rows past M; Mpad a multiple of 32 when M > 16); inv[m]: the factor undoing
+// row m's scaling. Tiles: 0-2 B, 3 (and 2) A, 4-7 C.
+//   M <= 16: per 32-value block, 4 weight tiles converted, one A load, four multiplies (1 x 4 output tiles).
+//   M > 16: per 32-row block and 32 columns, 2 weight tiles converted, two A loads, four multiplies (2 x 2 output
+//   tiles); with GGML_AMX_HALF_BUFFER_M set and reached, the slice is converted once into Bh ([KB][nt][16 x 32]).
+template <typename TB>
+static void amx_half_slice(bool fp16, int M, int K, const uint16_t * RESTRICT A, const float * RESTRICT inv,
+                           const char * RESTRICT Bq, int nt, uint16_t * RESTRICT Bh, float * RESTRICT C, int ldc) {
+    const int KB = K / 32;
+    const int TILE_SIZE = get_tile_size<TB>();
+    alignas(64) uint16_t Bl[4 * 512];
+    if (M <= 16) {
+        _tile_zero(4); _tile_zero(5); _tile_zero(6); _tile_zero(7);
+        for (int i = 0; i < KB; ++i) {
+            AMX_HALF_MEMORY_BARRIER();  // the previous block's tile loads of Bl come first
+            for (int t = 0; t < nt; ++t) {
+                amx_half_dequant<TB>(fp16, Bq + AMX_HALF_PACKED_INDEX(t, i, KB, TILE_SIZE), Bl + t * 512);
+            }
+            AMX_HALF_MEMORY_BARRIER();
+            _tile_loadd(3, A + (size_t)i * 512, 64);
+            _tile_loadd(0, Bl, 64);        AMX_HALF_DP(4, 3, 0);
+            _tile_loadd(1, Bl + 512, 64);  AMX_HALF_DP(5, 3, 1);
+            if (nt == 4) {
+                _tile_loadd(2, Bl + 1024, 64); AMX_HALF_DP(6, 3, 2);
+                _tile_loadd(0, Bl + 1536, 64); AMX_HALF_DP(7, 3, 0);
+            }
+        }
+        amx_half_store_C(0, nt, M, inv, C, ldc);
+        return;
+    }
+    const bool buffered = amx_half_buffer_m() > 0 && M >= amx_half_buffer_m();
+    if (buffered) {
+        for (int i = 0; i < KB; ++i) {
+            for (int t = 0; t < nt; ++t) {
+                amx_half_dequant<TB>(fp16, Bq + AMX_HALF_PACKED_INDEX(t, i, KB, TILE_SIZE), Bh + (size_t)(i * nt + t) * 512);
+            }
+        }
+        AMX_HALF_MEMORY_BARRIER();
+    }
+    for (int m0 = 0; m0 < M; m0 += 32) {
+        const uint16_t * A0 = A + (size_t)(m0 / 16) * KB * 512;
+        const uint16_t * A1 = A0 + (size_t)KB * 512;
+        for (int h = 0; h < nt; h += 2) {  // 32 columns at a time
+            _tile_zero(4); _tile_zero(5); _tile_zero(6); _tile_zero(7);
+            for (int i = 0; i < KB; ++i) {
+                const uint16_t * Bi;
+                if (buffered) {
+                    Bi = Bh + (size_t)(i * nt + h) * 512;
+                } else {
+                    AMX_HALF_MEMORY_BARRIER();  // the previous block's tile loads of Bl come first
+                    amx_half_dequant<TB>(fp16, Bq + AMX_HALF_PACKED_INDEX(h, i, KB, TILE_SIZE), Bl);
+                    amx_half_dequant<TB>(fp16, Bq + AMX_HALF_PACKED_INDEX(h + 1, i, KB, TILE_SIZE), Bl + 512);
+                    AMX_HALF_MEMORY_BARRIER();
+                    Bi = Bl;
+                }
+                _tile_loadd(0, Bi, 64);
+                _tile_loadd(3, A0 + (size_t)i * 512, 64);
+                AMX_HALF_DP(4, 3, 0);
+                _tile_loadd(1, Bi + 512, 64);
+                AMX_HALF_DP(6, 3, 1);
+                _tile_loadd(2, A1 + (size_t)i * 512, 64);
+                AMX_HALF_DP(5, 2, 0);
+                AMX_HALF_DP(7, 2, 1);
+            }
+            amx_half_store_C(1, 2, std::min(32, M - m0), inv + m0, C + (size_t)m0 * ldc + h * 16, ldc);
+        }
+    }
+}
+
+// GGML_AMX_HALF_CHECK=1: compare sampled outputs with an FP64 reference from the packed weights and the FP32
+// activations, and report the int8 path's error (Q8_0 activations) for the same outputs (slow; for testing)
+static bool amx_half_check() {
+    static const bool v = getenv("GGML_AMX_HALF_CHECK") != nullptr;
+    return v;
+}
+
+template <typename TB>
+static double amx_half_ref_dot(const char * B_slice, int KB, int col, const float * a, bool quantize_a,
+                               double * abs_sum = nullptr) {
+    const int TILE_SIZE = get_tile_size<TB>();
+    const int t = col / 16, n = col % 16;
+    double s = 0;
+    for (int i = 0; i < KB; ++i) {
+        const char * b_ptr = B_slice + AMX_HALF_PACKED_INDEX(t, i, KB, TILE_SIZE);
+        float d;
+        int8_t q[32];
+        if constexpr (std::is_same<TB, block_q4_0>::value) {
+            d = GGML_CPU_FP16_TO_FP32(((const ggml_half *)(b_ptr + TILE_N * TILE_K / 2))[n]);
+            for (int r = 0; r < 8; r += 2) {
+                for (int j = 0; j < 4; ++j) {
+                    const uint8_t byte = (uint8_t) b_ptr[r * 32 + n * 4 + j];
+                    q[r * 4 + j] = (int8_t)((byte & 0xF) - 8);
+                    q[(r + 1) * 4 + j] = (int8_t)((byte >> 4) - 8);
+                }
+            }
+        } else {
+            d = GGML_CPU_FP16_TO_FP32(((const ggml_half *)(b_ptr + TILE_N * TILE_K))[n]);
+            for (int r = 0; r < 8; ++r) {
+                for (int j = 0; j < 4; ++j) {
+                    q[r * 4 + j] = (int8_t) b_ptr[r * 64 + n * 4 + j];
+                }
+            }
+        }
+        const float * x = a + i * 32;
+        if (quantize_a) {  // as the int8 path: Q8_0 activations
+            float amax = 0;
+            for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(x[j]));
+            const float da = amax / 127.f;
+            const float ida = da ? 1.f / da : 0.f;
+            double bs = 0;
+            for (int j = 0; j < 32; ++j) bs += (double) q[j] * (double) roundf(x[j] * ida);
+            s += bs * (double) d * (double) GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(da));
+        } else {
+            for (int j = 0; j < 32; ++j) {
+                const double v = (double) q[j] * (double) d * (double) x[j];
+                s += v;
+                if (abs_sum) *abs_sum += std::fabs(v);
+            }
+        }
+    }
+    return s;
+}
+
+static void amx_half_report(double err, double err_int8, double scale) {
+    static std::atomic<long> n{0};
+    static std::atomic<double> sum_h{0}, sum_i{0}, max_h{0};
+    const double rh = err / scale, ri = err_int8 / scale;
+    double cur = sum_h.load(); while (!sum_h.compare_exchange_weak(cur, cur + rh)) {}
+    cur = sum_i.load(); while (!sum_i.compare_exchange_weak(cur, cur + ri)) {}
+    cur = max_h.load(); while (rh > cur && !max_h.compare_exchange_weak(cur, rh)) {}
+    const long c = ++n;
+    if ((c & (c - 1)) == 0 && c >= 256) {
+        fprintf(stderr, "amx_half (%s) checked %ld outputs: mean rel err %.3g (int8 path %.3g), max %.3g\n",
+                amx_half_use_fp16() ? "fp16" : "bf16", c, sum_h.load() / c, sum_i.load() / c, max_h.load());
+    }
+}
+
+#endif // __AMX_BF16__ && __AVX512BF16__
+
 #define LAUNCH_TINYGEMM_KERNEL_VNNI(NB_SIZE)                                                   \
     tinygemm_kernel_vnni<vec_dot_type, type, float, 1, NB_SIZE, blck_size>::apply(             \
         KB, wdata_batch,                                                                       \
@@ -2502,6 +2877,10 @@ size_t ggml_backend_amx_desired_wsize(const struct ggml_tensor * dst) {
         const size_t row_size_A = K / blck_size * sizeof(vec_dot_type);
         desired_wsize = n_batch * M * row_size_A;
     });
+    if (TYPE == GGML_TYPE_Q4_0 || TYPE == GGML_TYPE_Q8_0) {
+        const size_t Mpad = (M + 31) / 32 * 32;  // FP16 / BF16 activations and the rows' scale factors
+        desired_wsize = std::max(desired_wsize, (size_t) n_batch * Mpad * (K * sizeof(uint16_t) + sizeof(float)));
+    }
 
     return desired_wsize;
 }
@@ -2578,6 +2957,74 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
 
     // pointer to work space, used convert A from float to quantized type
     void * wdata = params->wdata;
+
+#if defined(GGML_AMX_HALF_KERNELS)
+    // Q4_0 / Q8_0 with GGML_AMX_HALF_MIN_M or more rows: FP16 / BF16 tiles (amx_half.inc) instead of the int8 kernel
+    if ((TYPE == GGML_TYPE_Q4_0 || TYPE == GGML_TYPE_Q8_0) && amx_half_min_m() > 0 && M >= amx_half_min_m()) {
+        const bool fp16 = amx_half_use_fp16();
+        const int Mpad = M <= 16 ? 16 : div_up(M, 32) * 32;
+        uint16_t * Ah = (uint16_t *) wdata;                                // [n_batch][Mpad * K], tile order
+        float * inv = (float *)(Ah + (size_t) n_batch * Mpad * K);         // [n_batch][Mpad]
+        // activations to FP16 / BF16, rows split over the threads; padding rows zero
+        parallel_for_ggml(params, n_batch * Mpad, [&](int begin, int end) {
+            for (int idx = begin; idx < end; ++idx) {
+                const int batch_idx = idx / Mpad;
+                const int m = idx % Mpad;
+                // tile order: 16-row blocks of KB tiles of 16 rows x 32 values
+                uint16_t * y = Ah + (size_t) batch_idx * Mpad * K + (size_t) (m / 16) * K * 16 + (m % 16) * 32;
+                const float * x = m < M ? (const float *)((const char *) src1->data + ggml_batch_offset(src1, batch_idx, ne2)) + (size_t) m * K : nullptr;
+                amx_half_convert_A(fp16, x, y, K, inv + idx);
+            }
+        });
+        ggml_barrier(params->threadpool);
+
+        constexpr int BLOCK_N = 4 * TILE_N;  // 64 columns per slice (32 at the edge of N)
+        const int NB = div_up(N, BLOCK_N);
+        parallel_for_ggml(params, n_batch * NB, [&](int begin, int end) {
+            if (begin >= end) {
+                return;
+            }
+            GGML_DISPATCH_QTYPES(TYPE, [&] {
+                if constexpr (std::is_same<type, block_q4_0>::value || std::is_same<type, block_q8_0>::value) {
+                    const int KB = K / blck_size;
+                    const int TILE_SIZE = get_tile_size<type>();
+                    static thread_local std::vector<uint16_t> Bh;
+                    if (amx_half_buffer_m() > 0 && M >= amx_half_buffer_m()) {
+                        Bh.resize((size_t) KB * 4 * 512);
+                    }
+                    amx_half_tile_config();
+                    for (int i = begin; i < end; ++i) {
+                        const int batch_idx = i / NB;
+                        const int nb = i % NB;
+                        const int64_t src0_offset = ggml_batch_offset(src0, batch_idx, ne2);
+                        const int64_t dst_offset  = ggml_batch_offset(dst,  batch_idx, ne2);
+                        const int nt = std::min(BLOCK_N, N - nb * BLOCK_N) / TILE_N;
+                        // the macro does not parenthesize n
+                        const char * B = (const char *) src0->data + src0_offset + PACKED_INDEX((nb * 4), 0, KB, TILE_SIZE);
+                        const uint16_t * A = Ah + (size_t) batch_idx * Mpad * K;
+                        float * C = (float *) dst->data + dst_offset + nb * BLOCK_N;
+                        amx_half_slice<type>(fp16, M, K, A, inv + (size_t) batch_idx * Mpad, B, nt, Bh.data(), C, ldc);
+                        if (amx_half_check()) {  // GGML_AMX_HALF_CHECK=1: two sampled outputs per slice
+                            for (int s = 0; s < 2; ++s) {
+                                const int m = (nb * 7 + s * 13) % M;
+                                const int col = (nb * 5 + s * 17) % (nt * TILE_N);
+                                const float * x = (const float *)((const char *) src1->data + ggml_batch_offset(src1, batch_idx, ne2)) + (size_t) m * K;
+                                double abs_sum = 0;
+                                const double ref = amx_half_ref_dot<type>(B, KB, col, x, false, &abs_sum);
+                                const double ref_int8 = amx_half_ref_dot<type>(B, KB, col, x, true);
+                                if (abs_sum > 0) {
+                                    amx_half_report(std::fabs(C[(size_t) m * ldc + col] - ref), std::fabs(ref_int8 - ref), abs_sum);
+                                }
+                            }
+                        }
+                    }
+                    amx_int8_tile_config_restore();
+                }
+            });
+        });
+        return;
+    }
+#endif
 
     //TODO: performance improvement: merge quant A
  // if (params->ith == 0) {
