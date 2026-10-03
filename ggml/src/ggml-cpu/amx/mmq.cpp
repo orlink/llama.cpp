@@ -2577,6 +2577,7 @@ struct amx_i8g_copy {
     std::vector<uint64_t> q5; // 5 / 6-bit: per tile and high bit b (bits - 4 planes) 16 words: bit k of word w is
                               // bit 4 + b of u[64 w + k], u = t + 2^(bits - 1)
     std::vector<float> s;     // scales [N / 16][K / G][16]
+    std::vector<int32_t> wsum;  // int8: 128 x the column sums per group [N / 16][K / G][16] (g256_rows.inc)
 };
 
 static int amx_i8g_env_int(const char * name, int dflt) {
@@ -2611,13 +2612,20 @@ static const amx_i8g_copy * amx_i8g_find(const void * packed) {
 
 // Called after a weight is repacked into the AMX buffer: builds the copy from GGML_AMX_I8G_FILE's tensor of the same
 // name (Q8_0 blocks, one shared scale per G values).
-static void amx_i8g_make_copy(const struct ggml_tensor * tensor) {
+static bool amx_i8g_make_copy(const struct ggml_tensor * tensor, const void * data) {
     const int G = amx_i8g_group();
     const char * path = getenv("GGML_AMX_I8G_FILE");
-    if (G <= 0 || G % 64 != 0 || path == nullptr) return;
+    // self: the tensor's own Q8_0 blocks (a model whose tensors share scales per G values; g256_rows.inc)
+    const bool self = path == nullptr || strcmp(path, "self") == 0;
+    if (G <= 0 || G % 64 != 0 || (self && (data == nullptr || tensor->type != GGML_TYPE_Q8_0))) return false;
     const int K = tensor->ne[0], N = tensor->ne[1];
-    if (K % G != 0 || N % 32 != 0 || ggml_nrows(tensor) != N) return;
+    if (K % G != 0 || N % 32 != 0 || ggml_nrows(tensor) != N) return false;
 
+    const size_t nblocks = (size_t) N * K / 32;
+    std::vector<block_q8_0> src;
+    if (self) {
+        src.assign((const block_q8_0 *) data, (const block_q8_0 *) data + nblocks);
+    } else {
     static std::mutex file_mutex;
     static gguf_context * ctx = nullptr;
     static FILE * fp = nullptr;
@@ -2628,21 +2636,21 @@ static void amx_i8g_make_copy(const struct ggml_tensor * tensor) {
         fp = fopen(path, "rb");
         if (ctx == nullptr || fp == nullptr) {
             fprintf(stderr, "amx_i8g: cannot read %s\n", path);
-            return;
+            return false;
         }
     }
     const int64_t idx = gguf_find_tensor(ctx, tensor->name);
-    if (idx < 0 || gguf_get_tensor_type(ctx, idx) != GGML_TYPE_Q8_0) return;
-    const size_t nblocks = (size_t) N * K / 32;
-    std::vector<block_q8_0> src(nblocks);
-    if (gguf_get_tensor_size(ctx, idx) != nblocks * sizeof(block_q8_0)) return;
+    if (idx < 0 || gguf_get_tensor_type(ctx, idx) != GGML_TYPE_Q8_0) return false;
+    src.resize(nblocks);
+    if (gguf_get_tensor_size(ctx, idx) != nblocks * sizeof(block_q8_0)) return false;
     if (fseeko(fp, (off_t)(gguf_get_data_offset(ctx) + gguf_get_tensor_offset(ctx, idx)), SEEK_SET) != 0 ||
         fread(src.data(), sizeof(block_q8_0), nblocks, fp) != nblocks) {
         fprintf(stderr, "amx_i8g: read failed for %s\n", tensor->name);
-        return;
+        return false;
+    }
     }
 
-    bool lowbit = false;
+    bool lowbit = self && getenv("GGML_AMX_I8G_BITS4") == nullptr;  // self: every tensor in the fewest bits it fits
     if (const char * b = getenv("GGML_AMX_I8G_BITS4")) {
         std::string list = b;
         size_t p = 0;
@@ -2661,7 +2669,7 @@ static void amx_i8g_make_copy(const struct ggml_tensor * tensor) {
         if (src[b].d != src[first].d) {
             static int skipped = 0;
             if (skipped++ < 3) fprintf(stderr, "amx_i8g: no copy of %s (scales not shared per %d values)\n", tensor->name, G);
-            return;
+            return false;
         }
     }
     auto * cp = new amx_i8g_copy();
@@ -2702,6 +2710,12 @@ static void amx_i8g_make_copy(const struct ggml_tensor * tensor) {
             }
         }
     } else {
+        cp->wsum.assign((size_t) N / 16 * NG * 16, 0);
+        for (size_t t = 0; t < tiles.size() / 1024; ++t) {  // tile t = column tile * KS + step
+            const size_t nt = t / KS;
+            const int g = (int)(t % KS) * 64 / G;
+            for (int i = 0; i < 1024; ++i) cp->wsum[(nt * NG + g) * 16 + (i % 64) / 4] += 128 * tiles[t * 1024 + i];
+        }
         cp->q = std::move(tiles);
     }
     std::lock_guard<std::mutex> lock2(amx_i8g_mutex);
@@ -2710,6 +2724,7 @@ static void amx_i8g_make_copy(const struct ggml_tensor * tensor) {
     if (reported++ < 3) {
         fprintf(stderr, "amx_i8g: copy of %s (%d x %d, groups of %d, %d-bit)\n", tensor->name, N, K, G, cp->bits);
     }
+    return true;
 }
 
 // Unpack one 4 / 5-bit weight tile (column tile nt, step ks) to int8 at dst (1 KB, in L1)
@@ -2951,6 +2966,216 @@ static void amx_i8g_report(double rel) {
     cur = sum.load(); while (!sum.compare_exchange_weak(cur, cur + rel)) {}
     const long c = ++n;
     if ((c & (c - 1)) == 0 && c >= 256) fprintf(stderr, "amx_i8g checked %ld outputs, diff relative to the terms: mean %.3g, max %.3g\n", c, sum.load() / c, mx.load());
+}
+#endif
+
+#if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
+// VNNI kernels for short passes on the grouped weights of amx_i8g.inc (inserted into ggml-cpu/amx/mmq.cpp by
+// tools/llama_amx_g256/apply_patch.py, after the ct8 patches).
+//
+// With a model whose matrix tensors share one scale per G (256) values, the grouped copy is the only weight format a
+// pass needs: AMX int8 tiles from GGML_AMX_I8G_MIN_M rows (amx_i8g.inc), these AVX512-VNNI kernels below that. They
+// read the copy's tiles directly: per 16-column tile and 64-value step, int8 as 16 VNNI vectors (k-quad j = 4 values
+// for 16 columns), or 4-bit nibbles (vector j low, j + 8 high) plus one / two planes of high bits that load straight
+// into mask registers. Activations are quantized per G values (one scale per row and group); one rescale per group.
+//
+// int8 weights: (a + 128) as u8 x w as s8, minus 128 x the column sums of each group (made at load).
+// 4/5/6-bit weights, stored as u = w + 2^(bits - 1): u as u8 x a as s8, minus 2^(bits - 1) x the row's group sum.
+
+constexpr int G256_ROWS_MAX = 8;
+
+// One activation row, plain order: int8 (y), the same + 128 as u8 (yu), one scale per G values (FP16-rounded
+// max / 127, as amx_i8g_quantize_row) and each group's sum of the int8 values.
+static void g256_quantize_row(const float * x, int8_t * y, uint8_t * yu, float * scales, int32_t * sums, int K, int G) {
+    for (int g0 = 0; g0 < K; g0 += G) {
+        __m512 vmax = _mm512_setzero_ps();
+        for (int k = g0; k < g0 + G; k += 16) vmax = _mm512_max_ps(vmax, _mm512_abs_ps(_mm512_loadu_ps(x + k)));
+        const float d = GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(_mm512_reduce_max_ps(vmax) / 127.0f));
+        scales[g0 / G] = d;
+        const __m512 id = _mm512_set1_ps(d ? 1.0f / d : 0.0f);
+        __m512i vs = _mm512_setzero_si512();
+        for (int k = g0; k < g0 + G; k += 16) {
+            const __m512i v = _mm512_cvtps_epi32(_mm512_roundscale_ps(_mm512_mul_ps(_mm512_loadu_ps(x + k), id), _MM_FROUND_TO_NEAREST_INT));
+            const __m128i q = _mm512_cvtsepi32_epi8(v);
+            vs = _mm512_add_epi32(vs, _mm512_cvtepi8_epi32(q));
+            _mm_storeu_si128((__m128i *)(y + k), q);
+            _mm_storeu_si128((__m128i *)(yu + k), _mm_xor_si128(q, _mm_set1_epi8((char)0x80)));
+        }
+        sums[g0 / G] = _mm512_reduce_add_epi32(vs);
+    }
+}
+
+// ROWS rows x NT 16-column tiles (nt0 ...), NACC independent sums per row (shorter chains of dependent multiplies).
+// A: int8 rows (low-bit weights) or u8 rows (int8 weights), row stride K; as / asum: [ROWS][NG].
+template <int BITS, int ROWS, int NT, int NACC>
+static void g256_rows_kernel(const amx_i8g_copy & cp, int nt0, const int8_t * RESTRICT A, const float * RESTRICT as,
+                             const int32_t * RESTRICT asum, float * RESTRICT C, int ldc) {
+    const int K = cp.K, G = cp.G, KS = K / 64, NG = K / G, GS = G / 64;
+    constexpr int PLANES = BITS < 8 ? BITS - 4 : 0;
+    const __m512i low = _mm512_set1_epi8(0xF);
+    const __m512i b16 = _mm512_set1_epi8(16), b32 = _mm512_set1_epi8(32);
+
+    __m512 vc[ROWS][NT];
+#pragma GCC unroll 8
+    for (int r = 0; r < ROWS; ++r)
+#pragma GCC unroll 4
+        for (int c = 0; c < NT; ++c) vc[r][c] = _mm512_setzero_ps();
+
+    for (int g = 0; g < NG; ++g) {
+#pragma GCC unroll 4
+        for (int c = 0; c < NT; ++c) {
+            const int nt = nt0 + c;
+            __m512i acc[NACC][ROWS];
+#pragma GCC unroll 4
+            for (int s = 0; s < NACC; ++s)
+#pragma GCC unroll 8
+                for (int r = 0; r < ROWS; ++r) acc[s][r] = _mm512_setzero_si512();
+            for (int s = 0; s < GS; ++s) {
+                const int ks = g * GS + s;
+                const size_t t = (size_t) nt * KS + ks;
+                const int8_t * a0 = A + ks * 64;
+                if constexpr (BITS == 8) {
+                    const int8_t * w = cp.q.data() + t * 1024;
+#pragma GCC unroll 16
+                    for (int j = 0; j < 16; ++j) {
+                        const __m512i vw = _mm512_loadu_si512((const __m512i *)(w + 64 * j));
+#pragma GCC unroll 8
+                        for (int r = 0; r < ROWS; ++r) {
+                            const int32_t av = *reinterpret_cast<const int32_t *>(a0 + (size_t) r * K + 4 * j);
+                            acc[j % NACC][r] = _mm512_dpbusd_epi32(acc[j % NACC][r], _mm512_set1_epi32(av), vw);
+                        }
+                    }
+                } else {
+                    const uint8_t * pk = cp.q4.data() + t * 512;
+                    const uint64_t * hb = cp.q5.data() + t * 16 * PLANES;
+#pragma GCC unroll 8
+                    for (int j = 0; j < 8; ++j) {
+                        const __m512i v = _mm512_loadu_si512((const __m512i *)(pk + 64 * j));
+                        __m512i lo = _mm512_and_si512(v, low);
+                        __m512i hi = _mm512_and_si512(_mm512_srli_epi16(v, 4), low);
+                        if constexpr (PLANES >= 1) {
+                            lo = _mm512_mask_add_epi8(lo, _cvtu64_mask64(hb[j]), lo, b16);
+                            hi = _mm512_mask_add_epi8(hi, _cvtu64_mask64(hb[j + 8]), hi, b16);
+                        }
+                        if constexpr (PLANES == 2) {
+                            lo = _mm512_mask_add_epi8(lo, _cvtu64_mask64(hb[16 + j]), lo, b32);
+                            hi = _mm512_mask_add_epi8(hi, _cvtu64_mask64(hb[16 + j + 8]), hi, b32);
+                        }
+#pragma GCC unroll 8
+                        for (int r = 0; r < ROWS; ++r) {
+                            const int8_t * ar = a0 + (size_t) r * K;
+                            acc[(2 * j) % NACC][r] = _mm512_dpbusd_epi32(acc[(2 * j) % NACC][r], lo, _mm512_set1_epi32(*reinterpret_cast<const int32_t *>(ar + 4 * j)));
+                            acc[(2 * j + 1) % NACC][r] = _mm512_dpbusd_epi32(acc[(2 * j + 1) % NACC][r], hi, _mm512_set1_epi32(*reinterpret_cast<const int32_t *>(ar + 4 * (j + 8))));
+                        }
+                    }
+                }
+            }
+            const __m512 ws = _mm512_loadu_ps(cp.s.data() + ((size_t) nt * NG + g) * 16);
+            __m512i corr8;
+            if constexpr (BITS == 8) corr8 = _mm512_loadu_si512((const __m512i *)(cp.wsum.data() + ((size_t) nt * NG + g) * 16));
+#pragma GCC unroll 8
+            for (int r = 0; r < ROWS; ++r) {
+                __m512i sum = acc[0][r];
+#pragma GCC unroll 4
+                for (int s = 1; s < NACC; ++s) sum = _mm512_add_epi32(sum, acc[s][r]);
+                if constexpr (BITS == 8) sum = _mm512_sub_epi32(sum, corr8);
+                else sum = _mm512_sub_epi32(sum, _mm512_set1_epi32(asum[r * NG + g] * (1 << (BITS - 1))));
+                vc[r][c] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(sum), _mm512_mul_ps(ws, _mm512_set1_ps(as[r * NG + g])), vc[r][c]);
+            }
+        }
+    }
+#pragma GCC unroll 8
+    for (int r = 0; r < ROWS; ++r)
+#pragma GCC unroll 4
+        for (int c = 0; c < NT; ++c) _mm512_storeu_ps(C + (size_t) r * ldc + (nt0 + c) * 16, vc[r][c]);
+}
+
+// tiles per call and sums per row by bits and pass size: the fastest of 1 / 2 / 4 tiles x 1 / 2 / 4 sums in a sweep on a
+// 4-core Granite Rapids host (g256_microbench.cpp SWEEP=1: 5-bit 10240 x 2560, 6-bit 2560 x 10240, int8 2560 x 2560; 4-bit as 5-bit)
+static inline int g256_rows_tiles(int bits, int rows) {
+    static const int8_t t[4][8] = {{1, 1, 1, 1, 1, 1, 1, 1}, {1, 1, 1, 1, 1, 1, 1, 1}, {1, 1, 1, 2, 1, 2, 1, 2}, {4, 1, 2, 1, 2, 1, 2, 1}};  // bits 4, 5, 6, 8
+    return t[bits == 8 ? 3 : bits - 4][rows - 1];
+}
+
+template <int BITS>
+static void g256_rows_bits(const amx_i8g_copy & cp, int rows, int nt0, int nt, const int8_t * A, const float * as,
+                           const int32_t * asum, float * C, int ldc) {
+#define G256_CASE(R, T, S) case R * 10 + T: g256_rows_kernel<BITS, R, T, S>(cp, nt0, A, as, asum, C, ldc); return;
+    if constexpr (BITS == 4) {
+        switch (rows * 10 + nt) { G256_CASE(1, 1, 2) G256_CASE(2, 1, 4) G256_CASE(3, 1, 4) G256_CASE(4, 1, 2) G256_CASE(5, 1, 4) G256_CASE(6, 1, 2) G256_CASE(7, 1, 2) G256_CASE(8, 1, 1) }
+    }
+    if constexpr (BITS == 5) {
+        switch (rows * 10 + nt) { G256_CASE(1, 1, 2) G256_CASE(2, 1, 4) G256_CASE(3, 1, 4) G256_CASE(4, 1, 2) G256_CASE(5, 1, 4) G256_CASE(6, 1, 2) G256_CASE(7, 1, 2) G256_CASE(8, 1, 1) }
+    }
+    if constexpr (BITS == 6) {
+        switch (rows * 10 + nt) { G256_CASE(1, 1, 4) G256_CASE(2, 1, 4) G256_CASE(3, 1, 2) G256_CASE(4, 2, 4) G256_CASE(5, 1, 1) G256_CASE(6, 2, 2) G256_CASE(7, 1, 2) G256_CASE(8, 2, 1) }
+    }
+    if constexpr (BITS == 8) {
+        switch (rows * 10 + nt) { G256_CASE(1, 4, 2) G256_CASE(1, 2, 2) G256_CASE(2, 1, 1) G256_CASE(3, 2, 1) G256_CASE(4, 1, 1) G256_CASE(5, 2, 2) G256_CASE(6, 1, 1) G256_CASE(7, 2, 1) G256_CASE(8, 1, 2) }
+    }
+#undef G256_CASE
+    fprintf(stderr, "Unexpected g256_rows block %d x %d (%d-bit)!\n", rows, nt, BITS);
+}
+
+// rows (1..8) x nt tiles from tile nt0; A = the int8 rows for low-bit copies, the u8 rows for int8 copies
+static void g256_rows(const amx_i8g_copy & cp, int rows, int nt0, int nt, const int8_t * As, const uint8_t * Au,
+                      const float * as, const int32_t * asum, float * C, int ldc) {
+    switch (cp.bits) {
+        case 8: g256_rows_bits<8>(cp, rows, nt0, nt, (const int8_t *) Au, as, asum, C, ldc); break;
+        case 6: g256_rows_bits<6>(cp, rows, nt0, nt, As, as, asum, C, ldc); break;
+        case 5: g256_rows_bits<5>(cp, rows, nt0, nt, As, as, asum, C, ldc); break;
+        case 4: g256_rows_bits<4>(cp, rows, nt0, nt, As, as, asum, C, ldc); break;
+        default: fprintf(stderr, "Unexpected g256 bits %d!\n", cp.bits);
+    }
+}
+
+// GGML_AMX_G256_ROWS: largest pass (rows) for these kernels (at most 8; 0: off). Default: GGML_AMX_I8G_MIN_M - 1 when
+// the copies come from the model itself (no GGML_AMX_I8G_FILE, or "self"), 0 with a side file (ct8: short passes keep
+// the original weights).
+static int g256_rows_max_m() {
+    static const int v = [] {
+        const char * f = getenv("GGML_AMX_I8G_FILE");
+        const bool self = f == nullptr || strcmp(f, "self") == 0;
+        return std::min(G256_ROWS_MAX, amx_i8g_env_int("GGML_AMX_G256_ROWS", self ? amx_i8g_min_m() - 1 : 0));
+    }();
+    return v;
+}
+
+// true when copies come from the model itself and the short-pass kernels take every pass below the AMX path: the
+// tensors' original packing is then never read (ggml_backend_amx_convert_weight skips it)
+static bool g256_covers_all() {
+    const char * f = getenv("GGML_AMX_I8G_FILE");
+    const bool self = f == nullptr || strcmp(f, "self") == 0;
+    return self && amx_i8g_group() > 0 && g256_rows_max_m() >= std::min(G256_ROWS_MAX, amx_i8g_min_m() - 1) && amx_i8g_min_m() <= G256_ROWS_MAX + 1;
+}
+
+// The same output in FP64 from the copy's integers and the plain-order int8 activation row m (GGML_AMX_I8G_CHECK)
+static double g256_ref(const amx_i8g_copy & cp, int n, const int8_t * As, const float * as, int m, double * abs_sum) {
+    const int K = cp.K, G = cp.G, KS = K / 64, NG = K / G;
+    double sum = 0;
+    for (int g = 0; g < NG; ++g) {
+        int64_t isum = 0;
+        for (int k = g * G; k < (g + 1) * G; ++k) {
+            const size_t ti = (size_t)(n / 16) * KS + k / 64;
+            const int within = ((k % 64) / 4) * 64 + (n % 16) * 4 + k % 4;
+            int w;
+            if (cp.bits < 8) {
+                const uint8_t b = cp.q4[ti * 512 + within % 512];
+                int u = within < 512 ? (b & 0xF) : (b >> 4);
+                for (int p = 0; p < cp.bits - 4; ++p) {
+                    u |= (int)((cp.q5[(ti * (cp.bits - 4) + p) * 16 + within / 64] >> (within % 64)) & 1) << (4 + p);
+                }
+                w = u - (1 << (cp.bits - 1));
+            } else {
+                w = cp.q[ti * 1024 + within];
+            }
+            isum += (int64_t) w * As[(size_t) m * K + k];
+        }
+        const double term = (double) isum * as[(size_t) m * NG + g] * cp.s[((size_t)(n / 16) * NG + g) * 16 + n % 16];
+        sum += term;
+        *abs_sum += std::fabs(term);
+    }
+    return sum;
 }
 #endif
 
@@ -3266,12 +3491,15 @@ void ggml_backend_amx_convert_weight(struct ggml_tensor * tensor, const void * d
     const int K = tensor->ne[0]; // ne0: in_features
     const int N = tensor->ne[1]; // ne1: out_features
 
+#if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
+    // a grouped copy made from the tensor itself that serves every pass size: the original packing is never read
+    if (amx_i8g_make_copy(tensor, data) && g256_covers_all()) {
+        return;
+    }
+#endif
     GGML_DISPATCH_QTYPES(TYPE, [&] {
         convert_B_packed_format<type, blck_size>((void *)((char *)tensor->data + offset), (const type *)data, N, K);
     });
-#if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
-    amx_i8g_make_copy(tensor);
-#endif
 }
 
 // ne2 is passed explicitly to help compiler optimize repeated calls
@@ -3439,6 +3667,54 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
                     }
                 }
                 amx_int8_tile_config_restore();
+            });
+            return;
+        }
+    }
+#endif
+
+#if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
+    // passes below GGML_AMX_I8G_MIN_M rows on the grouped weights: VNNI kernels (g256_rows.inc)
+    if (M <= g256_rows_max_m()) {
+        if (const amx_i8g_copy * cp = amx_i8g_find(src0->data); cp != nullptr && cp->K == K && cp->N == N) {
+            const int G = cp->G, NG = K / G;
+            int8_t * As = (int8_t *) wdata;                                   // [n_batch][M][K] int8
+            uint8_t * Au = (uint8_t *)(As + (size_t) n_batch * M * K);        // the same + 128 (u8)
+            float * as = (float *)(Au + (size_t) n_batch * M * K);            // [n_batch][M][NG] scales
+            int32_t * asum = (int32_t *)(as + (size_t) n_batch * M * NG);     // [n_batch][M][NG] sums
+            parallel_for_ggml(params, n_batch * M, [&](int begin, int end) {
+                for (int idx = begin; idx < end; ++idx) {
+                    const int batch_idx = idx / M;
+                    const int m = idx % M;
+                    const float * x = (const float *)((const char *) src1->data + ggml_batch_offset(src1, batch_idx, ne2)) + (size_t) m * K;
+                    g256_quantize_row(x, As + (size_t) idx * K, Au + (size_t) idx * K, as + (size_t) idx * NG, asum + (size_t) idx * NG, K, G);
+                }
+            });
+            ggml_barrier(params->threadpool);
+            const int NB = div_up(N, 64);
+            parallel_for_ggml(params, n_batch * NB, [&](int begin, int end) {
+                for (int i = begin; i < end; ++i) {
+                    const int batch_idx = i / NB;
+                    const int nb = i % NB;
+                    const size_t r0 = (size_t) batch_idx * M;
+                    float * C = (float *) dst->data + ggml_batch_offset(dst, batch_idx, ne2);
+                    const int tiles = std::min(4, N / 16 - nb * 4);
+                    const int ntm = g256_rows_tiles(cp->bits, M);
+                    for (int t = 0; t < tiles; t += ntm) {
+                        g256_rows(*cp, M, nb * 4 + t, std::min(ntm, tiles - t), As + r0 * K, Au + r0 * K, as + r0 * NG, asum + r0 * NG, C, ldc);
+                    }
+                    if (amx_i8g_check()) {
+                        for (int s = 0; s < 2; ++s) {
+                            const int m = (nb * 7 + s * 13) % M;
+                            const int n = nb * 64 + (nb * 5 + s * 17) % (tiles * 16);
+                            double abs_sum = 0;
+                            const double ref = g256_ref(*cp, n, As + r0 * K, as + r0 * NG, m, &abs_sum);
+                            if (abs_sum > 0) {
+                                amx_i8g_report(std::fabs(C[(size_t) m * ldc + n] - ref) / abs_sum);
+                            }
+                        }
+                    }
+                }
             });
             return;
         }
