@@ -13,6 +13,7 @@
 #endif
 
 #include "amx.h"
+#include "vec.h"
 #include "mmq.h"
 #include "ggml-impl.h"
 #include "ggml-cpu-impl.h"
@@ -3556,7 +3557,46 @@ size_t ggml_backend_amx_desired_wsize(const struct ggml_tensor * dst) {
 //
 // the function performs: dst = src1 @ src0.T for each batch
 //
+// glu != nullptr (ggml_backend_amx_mul_mat_geglu): dst is a gate/up product whose halves feed one GEGLU node (glu);
+// each task computes gate columns and the matching up columns, then glu's values for them (the GEGLU node is skipped)
+static void amx_mul_mat(const ggml_compute_params * params, struct ggml_tensor * dst, struct ggml_tensor * glu);
+
 void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_tensor * dst) {
+    amx_mul_mat(params, dst, nullptr);
+}
+
+// GEGLU on columns [c0, c0 + nc) of the M rows of the gate/up product C (ldc floats per row), into glu
+static void amx_geglu_cols(const float * C, int ldc, int M, int H, int c0, int nc, struct ggml_tensor * glu) {
+    const bool swapped = ggml_get_op_params_i32(glu, 1) != 0;
+    for (int m = 0; m < M; ++m) {
+        const float * row = C + (size_t) m * ldc;
+        const float * x = row + (swapped ? H : 0) + c0;
+        const float * g = row + (swapped ? 0 : H) + c0;
+        ggml_vec_geglu_f32(nc, (float *) ((char *) glu->data + (size_t) m * glu->nb[1]) + c0, x, g);
+    }
+}
+
+bool ggml_backend_amx_mul_mat_geglu(const ggml_compute_params * params, struct ggml_tensor * dst, struct ggml_tensor * glu) {
+#if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
+    const struct ggml_tensor * src0 = dst->src[0];
+    const int M = dst->ne[1], N = dst->ne[0], K = src0->ne[0];
+    if (dst->ne[2] * dst->ne[3] != 1 || dst->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 || N % 128 != 0 ||
+        glu->ne[0] != N / 2 || glu->ne[1] != M || glu->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float)) {
+        return false;
+    }
+    const amx_i8g_copy * cp = amx_i8g_find(src0->data);
+    if (cp == nullptr || cp->K != K || cp->N != N || (M > g256_rows_max_m() && M < amx_i8g_min_m())) {
+        return false;
+    }
+    amx_mul_mat(params, dst, glu);
+    return true;
+#else
+    GGML_UNUSED(params); GGML_UNUSED(dst); GGML_UNUSED(glu);
+    return false;
+#endif
+}
+
+static void amx_mul_mat(const ggml_compute_params * params, struct ggml_tensor * dst, struct ggml_tensor * glu) {
     struct ggml_tensor * src0 = dst->src[0];
     struct ggml_tensor * src1 = dst->src[1];
 
@@ -3645,6 +3685,24 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
             const int TPT = rows16 && amx_col_split_on() && n_batch * div_up(N, 64) < params->nth ? 2 : 4;
             const int NB = rows16 ? div_up(N / 16, TPT) : N / 32;
             amx_half_tile_config();  // once per thread: with GGML_AMX_DYN the loop body runs once per chunk
+            if (glu != nullptr) {  // gate block i and up block i, then their GEGLU values
+                const int H = N / 2, CW = rows16 ? 64 : 32, NBH = H / CW;
+                float * C = (float *) dst->data;
+                parallel_for_dyn(params, NBH, [&](int begin, int end) {
+                    for (int i = begin; i < end; ++i) {
+                        for (int half = 0; half < 2; ++half) {
+                            if (rows16) {
+                                amx_i8g_slice16(*cp, (half * H + i * 64) / 16, 4, M, Aq, as, C, ldc);
+                            } else {
+                                amx_i8g_slice(*cp, (half * H + i * 32) / 32, M, Aq, as, C, ldc);
+                            }
+                        }
+                        amx_geglu_cols(C, ldc, M, H, i * CW, CW, glu);
+                    }
+                });
+                amx_int8_tile_config_restore();
+                return;
+            }
             parallel_for_dyn(params, n_batch * NB, [&](int begin, int end) {
                 for (int i = begin; i < end; ++i) {
                     const int batch_idx = i / NB;
@@ -3704,6 +3762,23 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
             // tasks of 4 tiles (64 columns); narrow products with fewer of those than threads (e.g. 256 columns):
             // 2 tiles, so more threads get work (GGML_CPU_COL_SPLIT=0: always 4). Not 1: g256_rows_bits has no
             // single-tile kernel for some (bits, rows), e.g. 8-bit 1 row; every shape it picks within 2 tiles exists.
+            if (glu != nullptr) {  // gate block i and up block i (64 columns each), then their GEGLU values
+                const int H = N / 2, NBH = H / 64;
+                const int ntm = g256_rows_tiles(cp->bits, M);
+                float * C = (float *) dst->data;
+                parallel_for_dyn(params, NBH, [&](int begin, int end) {
+                    for (int i = begin; i < end; ++i) {
+                        for (int half = 0; half < 2; ++half) {
+                            const int t0 = (half * H + i * 64) / 16;
+                            for (int t = 0; t < 4; t += ntm) {
+                                g256_rows(*cp, M, t0 + t, std::min(ntm, 4 - t), As, Au, as, asum, C, ldc);
+                            }
+                        }
+                        amx_geglu_cols(C, ldc, M, H, i * 64, 64, glu);
+                    }
+                });
+                return;
+            }
             const int TPT = amx_col_split_on() && n_batch * div_up(N, 64) < params->nth ? 2 : 4;
             const int NB = div_up(N / 16, TPT);
             parallel_for_dyn(params, n_batch * NB, [&](int begin, int end) {

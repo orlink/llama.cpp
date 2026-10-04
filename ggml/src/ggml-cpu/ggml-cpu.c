@@ -3179,6 +3179,9 @@ struct ggml_cplan ggml_graph_plan(
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
 
+// amx/amx.cpp: MUL_MAT + GEGLU in one pass on AMX grouped weights (false: not applicable)
+bool ggml_cpu_amx_mul_mat_geglu(const struct ggml_compute_params * params, struct ggml_tensor * mm, struct ggml_tensor * glu);
+
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
         const int node_n,
@@ -3190,6 +3193,18 @@ static int ggml_cpu_try_fuse_ops(
     }
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
+
+    if (node->op == GGML_OP_MUL_MAT) {
+        // MUL_MAT + GLU (GEGLU of the product's two halves): the AMX backend's grouped weights do both per column block
+        const enum ggml_op fuse_ops[] = { GGML_OP_MUL_MAT, GGML_OP_GLU };
+        if (ggml_can_fuse(cgraph, node_n, fuse_ops, 2)) {
+            struct ggml_tensor * glu = cgraph->nodes[node_n + 1];
+            if (ggml_get_glu_op(glu) == GGML_GLU_OP_GEGLU && glu->src[0] == node && glu->src[1] == NULL &&
+                ggml_cpu_amx_mul_mat_geglu(params, node, glu)) {
+                return 1;
+            }
+        }
+    }
 
     if (node->op == GGML_OP_RMS_NORM) {
         // RMS_NORM + MUL fusion

@@ -247,3 +247,20 @@ ggml_backend_buffer_type_t ggml_backend_amx_buffer_type() {
 }
 
 #endif  // defined(__AMX_INT8__) && defined(__AVX512VNNI__)
+
+// ggml-cpu.c's fusion of MUL_MAT + GLU (GEGLU): true when the AMX backend did both (GGML_AMX_GEGLU=0: never)
+extern "C" bool ggml_cpu_amx_mul_mat_geglu(const struct ggml_compute_params * params, struct ggml_tensor * mm, struct ggml_tensor * glu) {
+#if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
+    static const bool on = [] {
+        const char * e = getenv("GGML_AMX_GEGLU");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (!on || mm->src[0]->buffer == nullptr || mm->src[0]->buffer->buft != ggml_backend_amx_buffer_type()) {
+        return false;
+    }
+    return ggml_backend_amx_mul_mat_geglu(params, mm, glu);
+#else
+    GGML_UNUSED(params); GGML_UNUSED(mm); GGML_UNUSED(glu);
+    return false;
+#endif
+}
