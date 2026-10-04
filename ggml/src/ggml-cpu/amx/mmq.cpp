@@ -3641,7 +3641,9 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
             parallel_for_dyn_prepare(params);
             ggml_barrier(params->threadpool);
             const bool rows16 = M <= 16;              // one activation tile, 64 columns per task
-            const int NB = rows16 ? div_up(N, 64) : N / 32;
+            // narrow products with fewer 64-column tasks than threads (e.g. 256 columns): 32 (GGML_CPU_COL_SPLIT=0: 64)
+            const int TPT = rows16 && amx_col_split_on() && n_batch * div_up(N, 64) < params->nth ? 2 : 4;
+            const int NB = rows16 ? div_up(N / 16, TPT) : N / 32;
             amx_half_tile_config();  // once per thread: with GGML_AMX_DYN the loop body runs once per chunk
             parallel_for_dyn(params, n_batch * NB, [&](int begin, int end) {
                 for (int i = begin; i < end; ++i) {
@@ -3653,8 +3655,8 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
                     float * C = (float *) dst->data + dst_offset;
                     int ncols;
                     if (rows16) {
-                        const int nt = std::min(4, N / 16 - nb * 4);
-                        amx_i8g_slice16(*cp, nb * 4, nt, M, A, asb, C, ldc);
+                        const int nt = std::min(TPT, N / 16 - nb * TPT);
+                        amx_i8g_slice16(*cp, nb * TPT, nt, M, A, asb, C, ldc);
                         ncols = nt * 16;
                     } else {
                         amx_i8g_slice(*cp, nb, M, A, asb, C, ldc);
@@ -3663,7 +3665,7 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
                     if (amx_i8g_check()) {
                         for (int s = 0; s < 2; ++s) {
                             const int m = (nb * 7 + s * 13) % M;
-                            const int n = nb * (rows16 ? 64 : 32) + (nb * 5 + s * 17) % ncols;
+                            const int n = nb * (rows16 ? TPT * 16 : 32) + (nb * 5 + s * 17) % ncols;
                             double abs_sum = 0;
                             const double ref = amx_i8g_ref(*cp, n, A, asb, m, &abs_sum);
                             const double got = C[(size_t) m * ldc + n];
