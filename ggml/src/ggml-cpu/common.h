@@ -12,6 +12,8 @@
 #ifdef __cplusplus
 
 #include <utility>
+#include <algorithm>
+#include <cstdlib>
 
 // convenience functions/macros for use in template calls
 // note: these won't be required after the 'traits' lookup table is used.
@@ -85,6 +87,29 @@ static std::pair<int64_t, int64_t> get_thread_range(const struct ggml_compute_pa
     const int64_t ir1 = MIN(ir0 + dr, nr);
 
     return {ir0, ir1};
+}
+
+// GGML_CPU_COL_SPLIT (default 1; 0: off): elementwise ops with fewer rows than threads (passes of 1-4 tokens) also split
+// each row's columns, in slices of a multiple of 64 values, so every thread gets work instead of one per row. The ops
+// compute each value on its own, so the results do not change.
+static inline bool ggml_col_split_on() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_CPU_COL_SPLIT");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return v;
+}
+
+// column slices per row for nr rows (1: split rows only); with more than 1, thread ith takes item ith of nr * slices
+static inline int64_t ggml_col_slices(int64_t nr, int nth) {
+    return ggml_col_split_on() && nr < nth ? nth / nr : 1;
+}
+
+// columns [c0, c1) of slice s of n columns cut into cs slices
+static inline void ggml_col_slice(int64_t n, int64_t cs, int64_t s, int64_t & c0, int64_t & c1) {
+    const int64_t step = ((n + cs - 1) / cs + 63) / 64 * 64;
+    c0 = std::min(n, s * step);
+    c1 = std::min(n, c0 + step);
 }
 
 struct ggml_fa_tile_config {

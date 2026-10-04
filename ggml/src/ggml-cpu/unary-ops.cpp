@@ -118,6 +118,25 @@ static void apply_unary_op(const ggml_compute_params * params, ggml_tensor * dst
     GGML_ASSERT( nb0 == sizeof(dst_t));
     GGML_ASSERT(nb00 == sizeof(src0_t));
 
+    const int64_t cs = ggml_col_slices(ggml_nrows(src0), params->nth);
+    if (cs > 1) {  // fewer rows than threads: each thread one slice of one row
+        if (params->ith >= ggml_nrows(src0) * cs) {
+            return;
+        }
+        const int64_t ir = params->ith / cs;
+        int64_t c0, c1;
+        ggml_col_slice(ne0, cs, params->ith % cs, c0, c1);
+        const int64_t i03 = ir/(ne02*ne01);
+        const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+        const int64_t i01 = (ir - i03*ne02*ne01 - i02*ne01);
+        dst_t        * dst_ptr  = (dst_t  *)       ((char *)       dst->data  + i03*nb3  + i02*nb2  + i01*nb1 );
+        const src0_t * src0_ptr = (const src0_t *) ((const char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01);
+        if (c1 > c0) {
+            vec_unary_op<op>(c1 - c0, dst_ptr + c0, src0_ptr + c0);
+        }
+        return;
+    }
+
     const auto [ir0, ir1] = get_thread_range(params, src0);
 
     for (int64_t ir = ir0; ir < ir1; ++ir) {

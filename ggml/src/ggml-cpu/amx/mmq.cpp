@@ -3117,6 +3117,15 @@ static void g256_rows_bits(const amx_i8g_copy & cp, int rows, int nt0, int nt, c
     fprintf(stderr, "Unexpected g256_rows block %d x %d (%d-bit)!\n", rows, nt, BITS);
 }
 
+// GGML_CPU_COL_SPLIT (default 1; 0: off), as in ggml-cpu/common.h: narrow products hand out single tiles
+static bool amx_col_split_on() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_CPU_COL_SPLIT");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return v;
+}
+
 // rows (1..8) x nt tiles from tile nt0; A = the int8 rows for low-bit copies, the u8 rows for int8 copies
 static void g256_rows(const amx_i8g_copy & cp, int rows, int nt0, int nt, const int8_t * As, const uint8_t * Au,
                       const float * as, const int32_t * asum, float * C, int ldc) {
@@ -3690,22 +3699,26 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
             });
             parallel_for_dyn_prepare(params);
             ggml_barrier(params->threadpool);
-            const int NB = div_up(N, 64);
+            // tasks of 4 tiles (64 columns); narrow products with fewer of those than threads (e.g. 256 columns):
+            // 2 tiles, so more threads get work (GGML_CPU_COL_SPLIT=0: always 4). Not 1: g256_rows_bits has no
+            // single-tile kernel for some (bits, rows), e.g. 8-bit 1 row; every shape it picks within 2 tiles exists.
+            const int TPT = amx_col_split_on() && n_batch * div_up(N, 64) < params->nth ? 2 : 4;
+            const int NB = div_up(N / 16, TPT);
             parallel_for_dyn(params, n_batch * NB, [&](int begin, int end) {
                 for (int i = begin; i < end; ++i) {
                     const int batch_idx = i / NB;
                     const int nb = i % NB;
                     const size_t r0 = (size_t) batch_idx * M;
                     float * C = (float *) dst->data + ggml_batch_offset(dst, batch_idx, ne2);
-                    const int tiles = std::min(4, N / 16 - nb * 4);
+                    const int tiles = std::min(TPT, N / 16 - nb * TPT);
                     const int ntm = g256_rows_tiles(cp->bits, M);
                     for (int t = 0; t < tiles; t += ntm) {
-                        g256_rows(*cp, M, nb * 4 + t, std::min(ntm, tiles - t), As + r0 * K, Au + r0 * K, as + r0 * NG, asum + r0 * NG, C, ldc);
+                        g256_rows(*cp, M, nb * TPT + t, std::min(ntm, tiles - t), As + r0 * K, Au + r0 * K, as + r0 * NG, asum + r0 * NG, C, ldc);
                     }
                     if (amx_i8g_check()) {
                         for (int s = 0; s < 2; ++s) {
                             const int m = (nb * 7 + s * 13) % M;
-                            const int n = nb * 64 + (nb * 5 + s * 17) % (tiles * 16);
+                            const int n = nb * TPT * 16 + (nb * 5 + s * 17) % (tiles * 16);
                             double abs_sum = 0;
                             const double ref = g256_ref(*cp, n, As + r0 * K, as + r0 * NG, m, &abs_sum);
                             if (abs_sum > 0) {

@@ -3062,6 +3062,26 @@ static void ggml_compute_forward_geglu_f32(
 
     const int32_t swapped = ggml_get_op_params_i32(dst, 1);
 
+    const int64_t cs = ggml_col_slices(nr, nth);
+    if (cs > 1) {  // fewer rows than threads: each thread one slice of one row
+        if (ith >= nr * cs) {
+            return;
+        }
+        const int i1 = ith / cs;
+        int64_t c0, c1;
+        ggml_col_slice(nc, cs, ith % cs, c0, c1);
+        float * src0_p = (float *) (src0_d + i1*src0_o);
+        float * src1_p = (float *) (src1_d + i1*src1_o);
+        if (!src1) {
+            src0_p += swapped ? nc : 0;
+            src1_p += swapped ? 0 : nc;
+        }
+        if (c1 > c0) {
+            ggml_vec_geglu_f32(c1 - c0, (float *) ((char *) dst->data + i1*(dst->nb[1])) + c0, src0_p + c0, src1_p + c0);
+        }
+        return;
+    }
+
     // rows per thread
     const int dr = (nr + nth - 1)/nth;
 
@@ -3947,6 +3967,37 @@ static void ggml_compute_forward_rms_norm_f32(
     float eps;
     memcpy(&eps, dst_rms_norm->op_params, sizeof(float));
     GGML_ASSERT(eps >= 0.0f);
+
+    const int64_t cs = ggml_col_slices(ne01*ne02*ne03, nth);
+    if (cs > 1) {  // fewer rows than threads: each thread the whole row's sum (as below), then one slice of the output
+        if (ith >= ne01*ne02*ne03*cs) {
+            return;
+        }
+        const int64_t ir = ith / cs;
+        const int64_t i03 = ir/(ne02*ne01);
+        const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+        const int64_t i01 = (ir - i03*ne02*ne01 - i02*ne01);
+        int64_t c0, c1;
+        ggml_col_slice(ne00, cs, ith % cs, c0, c1);
+        const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+        ggml_float sum = 0.0;
+        for (int64_t i00 = 0; i00 < ne00; i00++) {
+            sum += (ggml_float)(x[i00] * x[i00]);
+        }
+        const float mean  = sum/ne00;
+        const float scale = 1.0f/sqrtf(mean + eps);
+        float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
+        if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL) {
+            const float * w = (float *) ((char *) src1->data + (i01 % ne11)*nb11 + (i02 % ne12)*nb12 + (i03 % ne13)*nb13);
+            for (int64_t i00 = c0; i00 < c1; i00++) {
+                y[i00] = x[i00] * scale * w[i00];
+            }
+        } else if (c1 > c0) {
+            memcpy(y + c0, x + c0, (c1 - c0) * sizeof(float));
+            ggml_vec_scale_f32(c1 - c0, y + c0, scale);
+        }
+        return;
+    }
 
     // TODO: optimize
     for (int64_t i03 = 0; i03 < ne03; i03++) {
