@@ -16,7 +16,8 @@
 // Numerics: queries and softmax weights rounded to F16 (ggml's vector path also rounds the queries, and sums the values
 // in F16); scores, softmax and value sums in F32.
 // Supported: F32 queries, F16 keys and values, head sizes divisible by 32 (keys) and 16 (values), cached keys in blocks
-// of 32, no ALiBi, logit soft-capping or sinks. Everything else goes to ggml's own paths. GGML_FA_AMX=0 turns it off.
+// of 32, no ALiBi, logit soft-capping or sinks. Everything else, and single queries over 256 or fewer keys, goes to
+// ggml's own paths. GGML_FA_AMX=0 turns it off.
 
 #include "fa.h"
 
@@ -102,6 +103,15 @@ bool fa_amx_enabled() {
     return v;
 }
 
+// GGML_FA_AMX_MIN_SPLIT: fewest blocks of 32 keys per thread when the keys are split (short passes)
+int64_t fa_amx_min_split_blocks() {
+    static const int64_t v = [] {
+        const char * s = getenv("GGML_FA_AMX_MIN_SPLIT");
+        return s ? std::max(1, atoi(s)) : 2;
+    }();
+    return v;
+}
+
 bool fa_amx_supported(const ggml_tensor * dst) {
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
@@ -119,6 +129,10 @@ bool fa_amx_supported(const ggml_tensor * dst) {
     memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
     if (max_bias != 0.0f || logit_softcap != 0.0f) {
+        return false;
+    }
+    // one query over a short cache: ggml's vector path has less fixed cost
+    if (q->ne[1] == 1 && k->ne[1] <= 256) {
         return false;
     }
     const int64_t DK = k->ne[0], DV = v->ne[0];
@@ -421,11 +435,12 @@ bool ggml_fa_amx_compute(const struct ggml_compute_params * params, struct ggml_
     sh.tiles   = (sh.rows + 15) / 16;
     sh.nblocks = sh.k->ne[1] / 32;
 
-    // split the keys among threads when there are fewer tiles than threads, at least 4 blocks (128 keys) per split
+    // split the keys among threads when there are fewer tiles than threads, at least fa_amx_min_split_blocks() blocks
+    // of 32 keys per split
     const int64_t base = sh.Hkv * sh.q->ne[3] * sh.tiles;
     sh.splits = 1;
     if (base < nth) {
-        sh.splits = std::max<int64_t>(1, std::min<int64_t>((nth + base - 1) / base, sh.nblocks / 4));
+        sh.splits = std::max<int64_t>(1, std::min<int64_t>((nth + base - 1) / base, sh.nblocks / fa_amx_min_split_blocks()));
     }
     sh.blocks_per_split = (sh.nblocks + sh.splits - 1) / sh.splits;
     const int64_t items = base * sh.splits;
