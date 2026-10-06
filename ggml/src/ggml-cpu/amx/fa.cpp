@@ -112,6 +112,15 @@ int64_t fa_amx_min_split_blocks() {
     return v;
 }
 
+// GGML_FA_AMX_MIN_Q: fewest queries per pass sent to AMX (default 1; 64 = only where ggml's tiled F32 path runs)
+int64_t fa_amx_min_queries() {
+    static const int64_t v = [] {
+        const char * s = getenv("GGML_FA_AMX_MIN_Q");
+        return s ? std::max(1, atoi(s)) : 1;
+    }();
+    return v;
+}
+
 bool fa_amx_supported(const ggml_tensor * dst) {
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
@@ -129,6 +138,9 @@ bool fa_amx_supported(const ggml_tensor * dst) {
     memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
     if (max_bias != 0.0f || logit_softcap != 0.0f) {
+        return false;
+    }
+    if (q->ne[1] < fa_amx_min_queries()) {
         return false;
     }
     // one query over a short cache: ggml's vector path has less fixed cost
