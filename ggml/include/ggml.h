@@ -2508,6 +2508,12 @@ extern "C" {
             struct ggml_tensor * a,
             int32_t              n_kv_max);
 
+    // Preserve CPU accumulation order when unused query rows have been removed.
+    // Set 0 to select the kernel from the current query count.
+    GGML_API void ggml_flash_attn_ext_set_original_nq(
+            struct ggml_tensor * a,
+            int32_t              original_nq);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

@@ -2651,6 +2651,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        if (arch == LLM_ARCH_GEMMA4 && q->ne[1] * q->ne[3] < n_tokens) {
+            ggml_flash_attn_ext_set_original_nq(cur, n_tokens / q->ne[3]);
+        }
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);

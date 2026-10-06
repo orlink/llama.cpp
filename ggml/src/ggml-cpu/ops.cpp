@@ -9273,7 +9273,12 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool use_ref = params->use_ref;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    // Query pruning must not switch between tiled F32 accumulation and the
+    // vector F16 path, or introduce a new split-KV reduction order.
+    int32_t original_nq;
+    memcpy(&original_nq, (const char *) dst->op_params + 5 * sizeof(int32_t), sizeof(original_nq));
+    const int64_t kernel_nq = original_nq ? original_nq : neq1;
+    const bool use_split_kv_path = !use_ref && (kernel_nq == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
@@ -9334,7 +9339,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&
-                                neq1 >= Q_TILE_SZ);
+                                kernel_nq >= Q_TILE_SZ);
 #if defined(GGML_SIMD) && !defined(__x86_64__) && !defined(_M_X64)
 #if defined(__ARM_FEATURE_SVE)
         const int64_t f32_epr = svcntw();

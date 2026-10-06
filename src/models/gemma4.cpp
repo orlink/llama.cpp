@@ -1,4 +1,8 @@
 #include "models.h"
+#include "ggml-backend.h"
+
+#include <algorithm>
+#include <cstdlib>
 
 void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
@@ -154,6 +158,71 @@ static ggml_tensor * gemma4_view_2d_slice(ggml_context * ctx0, ggml_tensor * x, 
                         idx * x->ne[0] * x->ne[1] * ggml_element_size(x));
 }
 
+// Attention splits queries equally across KV streams. Pad shorter output lists
+// with a valid query from that stream, then discard padding before the LM head.
+class gemma4_output_rows : public llm_graph_input_i {
+public:
+    ggml_tensor * rows;
+    ggml_tensor * mask_rows;
+    ggml_tensor * compact_rows;
+    const int64_t n_stream;
+    const int64_t n_query;
+
+    static int64_t max_outputs(const llama_ubatch & batch, int64_t streams) {
+        const int64_t length = batch.n_tokens / streams;
+        int64_t result = 0;
+        for (int64_t s = 0; s < streams; ++s) {
+            int64_t count = 0;
+            for (int64_t i = 0; i < length; ++i) {
+                count += batch.output[s * length + i] != 0;
+            }
+            result = std::max(result, count);
+        }
+        return result;
+    }
+
+    gemma4_output_rows(ggml_context * ctx, const llama_ubatch & batch, int64_t streams, int64_t outputs) :
+        n_stream(streams), n_query(max_outputs(batch, streams)) {
+        rows         = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_query * n_stream);
+        mask_rows    = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_query, n_stream);
+        compact_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, outputs);
+        ggml_set_input(rows);
+        ggml_set_input(mask_rows);
+        ggml_set_input(compact_rows);
+        ggml_set_name(rows, "gemma4_output_rows");
+        ggml_set_name(mask_rows, "gemma4_mask_rows");
+        ggml_set_name(compact_rows, "gemma4_compact_rows");
+    }
+
+    void set_input(const llama_ubatch * batch) override {
+        const int64_t length = batch->n_tokens / n_stream;
+        std::vector<int32_t> selected(n_query * n_stream), masks(selected.size()), compact;
+        for (int64_t s = 0; s < n_stream; ++s) {
+            int64_t count = 0;
+            for (int64_t i = 0; i < length; ++i) {
+                if (batch->output[s * length + i]) {
+                    const int64_t j = s * n_query + count++;
+                    selected[j] = s * length + i;
+                    masks[j] = i;
+                    compact.push_back(j);
+                }
+            }
+            for (int64_t i = count; i < n_query; ++i) {
+                selected[s * n_query + i] = s * length;
+                masks[s * n_query + i] = 0;
+            }
+        }
+        GGML_ASSERT((int64_t) compact.size() == compact_rows->ne[0]);
+        ggml_backend_tensor_set(rows, selected.data(), 0, selected.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(mask_rows, masks.data(), 0, masks.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(compact_rows, compact.data(), 0, compact.size() * sizeof(int32_t));
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        return n_query == max_outputs(params.ubatch, n_stream);
+    }
+};
+
 llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_params & params) :
         llm_graph_context(params),
         model(model),
@@ -173,7 +242,34 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     // TODO: is causal == true correct? might need some changes
     auto * inp_attn = build_attn_inp_kv_iswa();
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // Shared-KV layers do not contribute to later tokens' cache. Once all KV
+    // writers have run, only requested output rows need the remaining layers.
+    // Unmasked MTP states and layer taps still require every token's state.
+    const char * prune_env = std::getenv("LLAMA_GEMMA4_EARLY_PRUNE");
+    const bool prune_enabled = !prune_env || std::atoi(prune_env) != 0;
+    const bool need_all_states = (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked) ||
+        std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(),
+                    [](bool enabled) { return enabled; });
+    const bool early_prune = prune_enabled && !need_all_states &&
+        hparams.n_layer_kv_from_start > 0 && hparams.n_layer_kv_from_start < n_layer &&
+        n_outputs < n_tokens && ubatch.n_pos == 1;
+    const int prune_layer = early_prune ? hparams.n_layer_kv_from_start - 1 : n_layer - 1;
+    const bool select_rows = early_prune || cparams.embeddings_nextn_masked;
+    int64_t n_tokens_cur = n_tokens;
+    ggml_tensor * inp_out_ids = nullptr;
+    ggml_tensor * mask_out_ids = nullptr;
+    ggml_tensor * compact_out_ids = nullptr;
+    const int64_t n_stream = inp_attn->get_kq_mask()->ne[3];
+    if (early_prune && n_outputs > 0 && n_stream > 1) {
+        auto rows = std::make_unique<gemma4_output_rows>(ctx0, ubatch, n_stream, n_outputs);
+        inp_out_ids = rows->rows;
+        mask_out_ids = rows->mask_rows;
+        compact_out_ids = rows->compact_rows;
+        res->add_input(std::move(rows));
+    } else if (!early_prune || n_outputs > 0) {
+        inp_out_ids = build_inp_out_ids();
+        mask_out_ids = inp_out_ids;
+    }
 
     ggml_tensor * inp_per_layer = nullptr;
     if (model.per_layer_tok_embd) {
@@ -215,14 +311,14 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             qkv_fused = build_lora_mm(model.layers[il].wqkv, cur, model.layers[il].wqkv_s);
             cb(qkv_fused, "wqkv", il);
             const int64_t q_dim = n_embd_head * n_head;
-            Qcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, q_dim, n_tokens, qkv_fused->nb[1], 0));
+            Qcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, q_dim, n_tokens_cur, qkv_fused->nb[1], 0));
         } else {
             Qcur = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s);
         }
         {
             cb(Qcur, "Qcur", il);
 
-            Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
+            Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens_cur);
 
             Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
             cb(Qcur, "Qcur_normed", il);
@@ -276,11 +372,29 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
                     Qcur, nullptr, nullptr, nullptr, nullptr, nullptr, hparams.f_attention_scale, il);
         }
 
-        // TODO @ngxson : strip unused token right after the last KV layer to speed up prompt processing
-        // keep all rows when extracting unmasked nextn embeddings (MTP target needs the hidden state for every token)
-        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
+        if (il == prune_layer && select_rows) {
+            // build_attn has already added all KV writes to the graph. No
+            // remaining activations are needed for an output-free prompt chunk.
+            if (early_prune && n_outputs == 0) {
+                return;
+            }
             cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
             inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
+            if (early_prune) {
+                n_tokens_cur = inp_out_ids->ne[0];
+                inp_pos = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0,
+                    ggml_reshape_2d(ctx0, inp_pos, 1, n_tokens), inp_out_ids), n_tokens_cur);
+                for (auto ** mask : { &inp_attn->self_kq_mask_cnv, &inp_attn->self_kq_mask_swa_cnv }) {
+                    const auto type = (*mask)->type;
+                    const int64_t n_kv = (*mask)->ne[0];
+                    *mask = ggml_reshape_3d(ctx0, *mask, n_kv, n_tokens / n_stream, n_stream);
+                    *mask = ggml_get_rows(ctx0, *mask, mask_out_ids);
+                    if ((*mask)->type != type) {
+                        *mask = ggml_cast(ctx0, *mask, type);
+                    }
+                    *mask = ggml_reshape_4d(ctx0, *mask, n_kv, n_tokens_cur / n_stream, 1, n_stream);
+                }
+            }
         }
         cur = build_norm(cur,
                 model.layers[il].attn_post_norm, nullptr,
@@ -387,8 +501,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
             ggml_tensor * inp_this_layer = gemma4_view_2d_slice(ctx0, inp_per_layer, il); // [n_embd_per_layer, n_tokens]
 
-            // TODO @ngxson : improve this
-            if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
+            if (il >= prune_layer && inp_out_ids && select_rows) {
                 inp_this_layer = ggml_get_rows(ctx0, inp_this_layer, inp_out_ids);
             }
 
@@ -419,6 +532,10 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             model.output_norm, nullptr,
             LLM_NORM_RMS, -1);
 
+    if (compact_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, compact_out_ids);
+    }
+
     // Expose the post-output-norm hidden state (the LM-head input feature) so that
     // MTP draft contexts can read it via llama_get_embeddings_nextn_ith() as the
     // recurrent h input. This matches the reference (transformers/vLLM/SGLang),
@@ -426,7 +543,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
-    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+    if (!select_rows && inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
 
