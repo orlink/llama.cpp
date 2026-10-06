@@ -5,6 +5,7 @@
 #include "ggml-backend.h"
 #include "traits.h"
 #include "ggml-cpu-impl.h"
+#include "amx/fa.h"
 #include "ggml-impl.h"
 #include "quants.h"
 #include "ggml-threading.h"
@@ -3114,7 +3115,10 @@ struct ggml_cplan ggml_graph_plan(
                         size_t n_chunks = n_tasks;
                         size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
 
-                        cur += MAX(prefill, decode);
+                        // AMX-FP16 path (amx/fa.cpp)
+                        size_t amx      = ggml_fa_amx_work_size(DK, DV, n_tasks);
+
+                        cur += MAX(MAX(prefill, decode), amx);
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:
                     {

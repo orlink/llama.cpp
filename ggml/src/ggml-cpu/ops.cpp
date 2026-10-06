@@ -7,6 +7,7 @@
 #include "ggml.h"
 #include "unary-ops.h"
 #include "vec.h"
+#include "amx/fa.h"
 
 #include <algorithm>
 #include <cfloat>
@@ -9265,6 +9266,11 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     GGML_ASSERT(nb0 <= nb1);
     GGML_ASSERT(nb1 <= nb2);
     GGML_ASSERT(nb2 <= nb3);
+
+    // AMX-FP16 tiles where the CPU and the operation allow it (amx/fa.cpp)
+    if (ggml_fa_amx_compute(params, dst)) {
+        return;
+    }
 
     const int ith = params->ith;
     const int nth = params->nth;
