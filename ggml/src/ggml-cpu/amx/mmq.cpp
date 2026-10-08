@@ -1,3 +1,4 @@
+#include <climits>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -2585,6 +2586,25 @@ static int amx_i8g_env_int(const char * name, int dflt) {
     return s ? atoi(s) : dflt;
 }
 static int amx_i8g_group() { static const int v = amx_i8g_env_int("GGML_AMX_I8G", 0); return v; }
+static int amx_reuse_mode() {
+    static const int mode = amx_i8g_env_int("GGML_AMX_REUSE", 2);
+    return mode;
+}
+
+// Rows from which the 5- and 6-bit full panel runs; INT_MAX for other tensors.
+static int amx_reuse_min(const char * name, bool ffn, bool output, int bits) {
+    static const int down = amx_i8g_env_int("GGML_AMX_REUSE_DOWN_MIN", 33);
+    static const int gate = amx_i8g_env_int("GGML_AMX_REUSE_GATE_MIN", 65);
+    static const int out = amx_i8g_env_int("GGML_AMX_REUSE_OUT_MIN", 33);
+    static const int down5 = amx_i8g_env_int("GGML_AMX_REUSE_DOWN5_MIN", 33);
+    static const int gate5 = amx_i8g_env_int("GGML_AMX_REUSE_GATE5_MIN", 128);
+    const bool down_w = strstr(name, ".ffn_down") != nullptr;
+    if (bits == 5) return !ffn ? INT_MAX : down_w ? down5 : gate5;
+    if (output) return out;
+    if (!ffn) return INT_MAX;
+    return down_w ? down : gate;
+}
+
 static int amx_i8g_min_m() { static const int v = amx_i8g_env_int("GGML_AMX_I8G_MIN_M", 9); return v; }
 static bool amx_i8g_check() { static const bool v = getenv("GGML_AMX_I8G_CHECK") != nullptr; return v; }
 static int amx_i8g_prefetch() { static const int v = amx_i8g_env_int("GGML_AMX_I8G_PREFETCH", 0); return v; }
@@ -2956,6 +2976,8 @@ static double amx_i8g_ref(const amx_i8g_copy & cp, int n, const int8_t * A, cons
     }
     return sum;
 }
+
+#include "reuse.inc"
 
 // difference relative to the sum of the groups' magnitudes (a relative difference to the result itself is unbounded
 // when the groups cancel out)
@@ -3640,11 +3662,30 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
             });
             parallel_for_dyn_prepare(params);
             ggml_barrier(params->threadpool);
-            const bool rows16 = M <= 16;              // one activation tile, 64 columns per task
+            const bool rows16 = M <= 16;
+            const int reuse = amx_reuse_mode();
+            const bool ffn = strstr(src0->name, ".ffn_") != nullptr;
+            const bool output = strcmp(src0->name, "token_embd.weight") == 0 || strcmp(src0->name, "output.weight") == 0;
+            const bool small = (reuse & 1) && M >= 9 && rows16 && G == 256 &&
+                               (cp->bits == 4 || cp->bits == 6) && (ffn || output);
+            const bool configure_once = small && (reuse & 8);
+            const bool panel = G == 256 &&
+                               (((reuse & 2) && (cp->bits == 6 || cp->bits == 5) && M >= amx_reuse_min(src0->name, ffn, output, cp->bits)) ||
+                                ((reuse & 16) && cp->bits == 4 && ffn && M >= 65));
+            const bool group64 = (reuse & 4) && G == 256 && cp->bits == 6 && ffn && M == 64;
+            // Private reusable storage: no expanded model copy or per-column allocations.
+            int8_t * unpacked = nullptr;
+            if (panel) {
+                static thread_local std::vector<int8_t> scratch;
+                const size_t bytes = (size_t) K * 32 + 63;
+                if (scratch.size() < bytes) scratch.resize(bytes);
+                unpacked = (int8_t *) (((uintptr_t) scratch.data() + 63) & ~(uintptr_t) 63);
+            }
             // narrow products with fewer 64-column tasks than threads (e.g. 256 columns): 32 (GGML_CPU_COL_SPLIT=0: 64)
             const int TPT = rows16 && amx_col_split_on() && n_batch * div_up(N, 64) < params->nth ? 2 : 4;
-            const int NB = rows16 ? div_up(N / 16, TPT) : N / 32;
-            amx_half_tile_config();  // once per thread: with GGML_AMX_DYN the loop body runs once per chunk
+            const int NB = small ? N / 16 : rows16 ? div_up(N / 16, TPT) : N / 32;
+            if (configure_once) amx_reuse_register_config(M);
+            else amx_half_tile_config();  // once per thread, before the column loop
             parallel_for_dyn(params, n_batch * NB, [&](int begin, int end) {
                 for (int i = begin; i < end; ++i) {
                     const int batch_idx = i / NB;
@@ -3654,7 +3695,16 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
                     const float * asb = as + (size_t) batch_idx * Mpad * NG;
                     float * C = (float *) dst->data + dst_offset;
                     int ncols;
-                    if (rows16) {
+                    if (small) {
+                        amx_reuse_register<false>(*cp, nb, M, A, asb, C, ldc, nullptr, !configure_once);
+                        ncols = 16;
+                    } else if (panel) {
+                        amx_reuse_panel(*cp, nb, M, A, asb, C, ldc, true, unpacked);
+                        ncols = 32;
+                    } else if (group64) {
+                        amx_reuse_group<64>(*cp, nb, M, A, asb, C, ldc, true);
+                        ncols = 32;
+                    } else if (rows16) {
                         const int nt = std::min(TPT, N / 16 - nb * TPT);
                         amx_i8g_slice16(*cp, nb * TPT, nt, M, A, asb, C, ldc);
                         ncols = nt * 16;
@@ -3665,7 +3715,7 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
                     if (amx_i8g_check()) {
                         for (int s = 0; s < 2; ++s) {
                             const int m = (nb * 7 + s * 13) % M;
-                            const int n = nb * (rows16 ? TPT * 16 : 32) + (nb * 5 + s * 17) % ncols;
+                            const int n = nb * (small ? 16 : rows16 ? TPT * 16 : 32) + (nb * 5 + s * 17) % ncols;
                             double abs_sum = 0;
                             const double ref = amx_i8g_ref(*cp, n, A, asb, m, &abs_sum);
                             const double got = C[(size_t) m * ldc + n];
