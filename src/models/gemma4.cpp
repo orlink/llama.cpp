@@ -553,7 +553,10 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     // lm_head
     cur = build_lora_mm(model.output, cur, model.output_s);
 
-    if (hparams.f_final_logit_softcapping) {
+    // LLAMA_GEMMA4_SKIP_SOFTCAP=1: no softcap; tanh is monotonic, so greedy picks the same tokens
+    const char * skip_softcap_env = std::getenv("LLAMA_GEMMA4_SKIP_SOFTCAP");
+    const bool skip_softcap = skip_softcap_env && std::atoi(skip_softcap_env) != 0;
+    if (hparams.f_final_logit_softcapping && !skip_softcap) {
         cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
         cur = ggml_tanh(ctx0, cur);
         cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
